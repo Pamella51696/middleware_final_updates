@@ -24,11 +24,11 @@ import org.opencv.videoio.Videoio;
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
  *
- *   fisheye pixels → 3D rays → R_camera (extrinsics) → common vehicle frame
- *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
+ *   Each fisheye → 3D ray → R_camera → one vehicle frame → cylindrical (θ, φ)
+ *   All four cameras warp into the SAME canvas (no sequential A+B+C+D stitch)
+ *   Min-error seam in each overlap → multi-band blend
  *
- * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
- * Clips are discovered in the working folder (left / front / right / rear).
+ * Horizon is φ = 0 from pose. Clips: left / front / right / rear in the folder.
  */
 public class VideoStreamingServer {
 
@@ -37,18 +37,19 @@ public class VideoStreamingServer {
     private static final int PANEL_HEIGHT = 400;
     /** Row of the common world horizon (fraction from the top). */
     private static final double HORIZON_FRACTION = 0.40;
-    /** Horizontal field of each spherical panel (deg). >90 leaves overlap. */
-    private static final double PANEL_YAW_DEG = 118.0;
+    /** Horizontal field of each panel (deg). 120° → ~25% overlap at 90° spacing. */
+    private static final double PANEL_YAW_DEG = 120.0;
     /** Vertical field around the horizon (deg). */
-    private static final double PANEL_PITCH_DEG = 72.0;
-    /** Equidistant fisheye input FOV used to build K when no calib file exists. */
-    private static final double INPUT_FISHEYE_FOV_DEG = 160.0;
-    /** Only treat near-black remap holes as invalid (keep dark asphalt). */
+    private static final double PANEL_PITCH_DEG = 70.0;
+    /** Assumed full fisheye FOV. Larger = sample closer to the disk center (less rim stretch). */
+    private static final double INPUT_FISHEYE_FOV_DEG = 180.0;
+    /** Do not sample the fisheye beyond this incidence angle (distorted rim). */
+    private static final double MAX_INCIDENCE_DEG = 76.0;
+    /** Near-black remap holes. */
     private static final double INVALID_LUMA = 3.0;
-    /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
-    private static final int MIN_BLEND_PX = 200;
-    /** Fade distance from unmapped (black) pixels. */
-    private static final int EDGE_FEATHER_PX = 56;
+    /** Half-width of the multi-band transition around the optimized seam. */
+    private static final int SEAM_BLEND_PX = 36;
+    private static final int PYRAMID_LEVELS = 4;
 
     /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
     private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
@@ -176,6 +177,7 @@ public class VideoStreamingServer {
             }
 
             int overlap = panelOverlapPx();
+            int[][] seams = null;
             ex.getResponseHeaders().set("Content-Type",
                     "multipart/x-mixed-replace; boundary=frame");
             ex.sendResponseHeaders(200, 0);
@@ -205,7 +207,10 @@ public class VideoStreamingServer {
                     if (!allReady) {
                         continue;
                     }
-                    Mat panorama = featherStitch(ready, overlap);
+                    if (seams == null) {
+                        seams = computeSeams(ready, overlap);
+                    }
+                    Mat panorama = blendToCanvas(ready, overlap, seams);
                     writeFrame(out, encodeJpeg(panorama));
                     panorama.release();
                 }
@@ -251,8 +256,10 @@ public class VideoStreamingServer {
     }
 
     /**
-     * One surround camera: spherical dest pixels are inverse-projected through
-     * the vehicle frame and the fisheye model into the raw frame.
+     * One surround camera: cylindrical dest pixels are inverse-projected through
+     * the vehicle frame and the fisheye model into the raw frame. Rays beyond
+     * {@code MAX_INCIDENCE_DEG} are left unmapped so the seam can use the
+     * neighbor instead of a stretched rim.
      */
     static final class SphericalPanel {
         private final int index;
@@ -288,6 +295,9 @@ public class VideoStreamingServer {
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
             double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
+            // Cylindrical vertical: equal meters on a cylinder, less edge squash than linear φ.
+            double fy = (PANEL_HEIGHT / 2.0) / Math.tan(pitchSpan / 2.0);
+            double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
 
             Mat mapX = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
             Mat mapY = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
@@ -295,17 +305,14 @@ public class VideoStreamingServer {
             float[] rowY = new float[PANEL_WIDTH];
 
             for (int v = 0; v < PANEL_HEIGHT; v++) {
-                // φ = 0 on the shared horizon row; positive φ is sky (up).
-                double phi = (horizonY - v) / PANEL_HEIGHT * pitchSpan;
+                double phi = Math.atan((horizonY - (v + 0.5)) / fy);
                 double cphi = Math.cos(phi);
                 double sphi = Math.sin(phi);
                 for (int u = 0; u < PANEL_WIDTH; u++) {
                     double theta = yaw0 + ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
-                    // Vehicle frame: X forward, Y right, Z up.
                     double xv = cphi * Math.cos(theta);
                     double yv = cphi * Math.sin(theta);
                     double zv = sphi;
-                    // ray_camera = R^T * ray_vehicle  (OpenCV: X right, Y down, Z forward)
                     double xc = R[0] * xv + R[3] * yv + R[6] * zv;
                     double yc = R[1] * xv + R[4] * yv + R[7] * zv;
                     double zc = R[2] * xv + R[5] * yv + R[8] * zv;
@@ -315,10 +322,22 @@ public class VideoStreamingServer {
                         continue;
                     }
                     double inc = Math.atan2(Math.hypot(xc, yc), zc);
+                    if (inc > maxInc) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                        continue;
+                    }
                     double r = f * inc;
                     double az = Math.atan2(yc, xc);
-                    rowX[u] = (float) (cx + r * Math.cos(az));
-                    rowY[u] = (float) (cy + r * Math.sin(az));
+                    float su = (float) (cx + r * Math.cos(az));
+                    float sv = (float) (cy + r * Math.sin(az));
+                    if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                    } else {
+                        rowX[u] = su;
+                        rowY[u] = sv;
+                    }
                 }
                 mapX.put(v, 0, rowX);
                 mapY.put(v, 0, rowY);
@@ -400,158 +419,309 @@ public class VideoStreamingServer {
     static int panelOverlapPx() {
         double spacing = 90.0;
         double overlapDeg = PANEL_YAW_DEG - spacing;
-        if (overlapDeg < 4.0) overlapDeg = 4.0;
+        if (overlapDeg < 8.0) overlapDeg = 8.0;
         int px = (int) Math.round(overlapDeg / PANEL_YAW_DEG * PANEL_WIDTH);
-        px = Math.max(MIN_BLEND_PX, px);
-        return Math.max(16, Math.min(PANEL_WIDTH / 3, px));
+        // ~25% of a panel; enough to search a seam, not a 50/50 ghost band.
+        return Math.max(48, Math.min(PANEL_WIDTH / 3, px));
     }
 
-    static Mat featherStitch(Mat[] frames, int overlap) {
-        int N = frames.length;
-        int H = PANEL_HEIGHT;
+    static int[][] computeSeams(Mat[] panels, int overlap) {
+        int N = panels.length;
+        int[][] seams = new int[N - 1][];
         int W = PANEL_WIDTH;
-        int panoW = W + (N - 1) * (W - overlap);
-        double[] gain = sequentialGains(frames, overlap);
-
-        Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
-        Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
-
-        for (int i = 0; i < N; i++) {
-            int xStart = i * (W - overlap);
-            // Incoming panel ramps in slowly so it does not stamp over the
-            // previous feed (the left→front overwrite). Outgoing stays visible
-            // longer into the seam.
-            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1, 1.70, 0.52);
-            Mat edgeW = edgeDistanceWeight(frames[i], EDGE_FEATHER_PX);
-            Core.multiply(weight, edgeW, weight);
-            edgeW.release();
-
-            Mat frameF = new Mat();
-            frames[i].convertTo(frameF, CvType.CV_32FC3);
-            if (Math.abs(gain[i] - 1.0) > 0.01) {
-                Core.multiply(frameF, new Scalar(gain[i], gain[i], gain[i]), frameF);
-            }
-            Mat weight3 = new Mat();
-            List<Mat> ch = new ArrayList<>();
-            ch.add(weight); ch.add(weight); ch.add(weight);
-            Core.merge(ch, weight3);
-            Mat wFrame = new Mat();
-            Core.multiply(frameF, weight3, wFrame);
-
-            int xEnd = Math.min(xStart + W, panoW);
-            int wActual = xEnd - xStart;
-            Mat colorRoi  = accumColor.submat(0, H, xStart, xEnd);
-            Mat weightRoi = accumWeight.submat(0, H, xStart, xEnd);
-            Core.add(colorRoi,  wFrame.colRange(0, wActual), colorRoi);
-            Core.add(weightRoi, weight.colRange(0, wActual), weightRoi);
-
-            colorRoi.release();
-            weightRoi.release();
-            frameF.release();
-            weight.release();
-            weight3.release();
-            wFrame.release();
+        for (int i = 0; i < N - 1; i++) {
+            Mat leftOv  = panels[i].colRange(W - overlap, W);
+            Mat rightOv = panels[i + 1].colRange(0, overlap);
+            seams[i] = minErrorSeam(leftOv, rightOv);
+            leftOv.release();
+            rightOv.release();
         }
-
-        Mat safeW = new Mat();
-        Core.max(accumWeight, new Scalar(1e-6), safeW);
-        Mat safeW3 = new Mat();
-        List<Mat> wch = new ArrayList<>();
-        wch.add(safeW); wch.add(safeW); wch.add(safeW);
-        Core.merge(wch, safeW3);
-        Mat blended = new Mat();
-        Core.divide(accumColor, safeW3, blended);
-        Mat result = new Mat();
-        blended.convertTo(result, CvType.CV_8UC3);
-
-        accumColor.release();
-        accumWeight.release();
-        safeW.release();
-        safeW3.release();
-        blended.release();
-        return result;
+        return seams;
     }
 
     /**
-     * Raised-cosine seam. {@code inExp} &gt; 1 makes the new panel fade in slowly;
-     * {@code outExp} &lt; 1 keeps the old panel visible further into the overlap.
+     * Vertical seam through the overlap that minimizes |I_left − I_right|.
+     * Pixels left of the seam stay on the previous camera.
      */
-    static Mat buildFeatherMask(int H, int W, int overlap,
-                                boolean fadeLeft, boolean fadeRight,
-                                double inExp, double outExp) {
-        Mat mask = new Mat(H, W, CvType.CV_32FC1, new Scalar(1.0));
-        if (overlap <= 0) {
-            return mask;
-        }
-        for (int x = 0; x < overlap; x++) {
-            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * x / overlap);
-            if (fadeLeft) {
-                float alpha = (float) Math.pow(cosine, inExp);
-                Mat colL = mask.col(x);
-                colL.setTo(new Scalar(alpha));
-                colL.release();
+    static int[] minErrorSeam(Mat left, Mat right) {
+        int H = left.rows();
+        int W = left.cols();
+        Mat ga = new Mat();
+        Mat gb = new Mat();
+        Imgproc.cvtColor(left, ga, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.cvtColor(right, gb, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.GaussianBlur(ga, ga, new Size(5, 5), 1.0);
+        Imgproc.GaussianBlur(gb, gb, new Size(5, 5), 1.0);
+        Mat diff = new Mat();
+        Core.absdiff(ga, gb, diff);
+
+        double[][] cost = new double[H][W];
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                double la = ga.get(y, x)[0];
+                double lb = gb.get(y, x)[0];
+                boolean va = la > INVALID_LUMA;
+                boolean vb = lb > INVALID_LUMA;
+                if (!va && !vb) {
+                    cost[y][x] = 1e5;
+                } else if (!va) {
+                    cost[y][x] = 12;
+                } else if (!vb) {
+                    cost[y][x] = 12;
+                } else {
+                    cost[y][x] = diff.get(y, x)[0];
+                }
             }
-            if (fadeRight) {
-                float alpha = (float) Math.pow(cosine, outExp);
-                Mat colR = mask.col(W - 1 - x);
-                colR.setTo(new Scalar(alpha));
-                colR.release();
+        }
+        ga.release();
+        gb.release();
+        diff.release();
+
+        double[][] dp = new double[H][W];
+        int[][] pred = new int[H][W];
+        System.arraycopy(cost[0], 0, dp[0], 0, W);
+        for (int y = 1; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int bestP = x;
+                double best = dp[y - 1][x];
+                if (x > 0 && dp[y - 1][x - 1] < best) {
+                    best = dp[y - 1][x - 1];
+                    bestP = x - 1;
+                }
+                if (x + 1 < W && dp[y - 1][x + 1] < best) {
+                    best = dp[y - 1][x + 1];
+                    bestP = x + 1;
+                }
+                dp[y][x] = cost[y][x] + best;
+                pred[y][x] = bestP;
             }
         }
-        return mask;
+        int end = 0;
+        double bestEnd = dp[H - 1][0];
+        for (int x = 1; x < W; x++) {
+            if (dp[H - 1][x] < bestEnd) {
+                bestEnd = dp[H - 1][x];
+                end = x;
+            }
+        }
+        int[] seam = new int[H];
+        seam[H - 1] = end;
+        for (int y = H - 1; y > 0; y--) {
+            seam[y - 1] = pred[y][seam[y]];
+        }
+        return seam;
     }
 
-    static Mat edgeDistanceWeight(Mat bgr, int radius) {
+    /**
+     * Warp every panel onto one canvas, then multi-band blend with seam masks.
+     * Cameras are not chained (no A+B then +C then +D).
+     */
+    static Mat blendToCanvas(Mat[] panels, int overlap, int[][] seams) {
+        int N = panels.length;
+        int H = PANEL_HEIGHT;
+        int W = PANEL_WIDTH;
+        int panoW = W + (N - 1) * (W - overlap);
+
+        Mat[] placed = new Mat[N];
+        Mat[] weights = new Mat[N];
+        for (int i = 0; i < N; i++) {
+            placed[i] = Mat.zeros(H, panoW, CvType.CV_8UC3);
+            weights[i] = Mat.zeros(H, panoW, CvType.CV_32FC1);
+            int x0 = i * (W - overlap);
+            Mat dstRoi = placed[i].colRange(x0, x0 + W);
+            panels[i].copyTo(dstRoi);
+            dstRoi.release();
+            Mat wRoi = weights[i].colRange(x0, x0 + W);
+            Mat vm = validMask(panels[i]);
+            vm.copyTo(wRoi);
+            vm.release();
+            wRoi.release();
+        }
+
+        for (int i = 0; i < N - 1; i++) {
+            int x0 = (i + 1) * (W - overlap);
+            applySeamToWeights(weights[i], weights[i + 1], seams[i], x0, overlap, H);
+        }
+
+        blurWeights(weights, SEAM_BLEND_PX);
+        rezeroInvalid(weights, placed);
+        normalizeWeights(weights);
+
+        Mat result = multibandBlend(placed, weights, PYRAMID_LEVELS);
+        for (int i = 0; i < N; i++) {
+            placed[i].release();
+            weights[i].release();
+        }
+        return result;
+    }
+
+    static Mat validMask(Mat bgr) {
         Mat gray = new Mat();
         Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
         Mat mask = new Mat();
-        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
-        Mat dist = new Mat();
-        Imgproc.distanceTransform(mask, dist, Imgproc.DIST_L2, 3);
-        Mat weight = new Mat();
-        double scale = radius < 1 ? 1.0 : 1.0 / radius;
-        dist.convertTo(weight, CvType.CV_32FC1, scale);
-        Core.min(weight, new Scalar(1.0), weight);
+        Imgproc.threshold(gray, mask, INVALID_LUMA, 1.0, Imgproc.THRESH_BINARY);
+        Mat out = new Mat();
+        mask.convertTo(out, CvType.CV_32FC1);
         gray.release();
         mask.release();
-        dist.release();
-        return weight;
+        return out;
     }
 
-    static double[] sequentialGains(Mat[] frames, int overlap) {
-        double[] gain = new double[frames.length];
-        java.util.Arrays.fill(gain, 1.0);
-        for (int i = 1; i < frames.length; i++) {
-            double left = overlapMean(frames[i - 1], true, overlap);
-            double right = overlapMean(frames[i], false, overlap);
-            if (left < 8 || right < 8) {
-                continue;
+    static void applySeamToWeights(Mat wLeft, Mat wRight, int[] seam,
+                                   int x0, int overlap, int H) {
+        Mat keepLeft = new Mat(H, overlap, CvType.CV_32FC1);
+        float[] row = new float[overlap];
+        for (int y = 0; y < H; y++) {
+            int s = seam[y];
+            if (s < 0) s = 0;
+            if (s > overlap) s = overlap;
+            for (int x = 0; x < overlap; x++) {
+                row[x] = x < s ? 1f : 0f;
             }
-            double g = left / right;
-            if (g < 0.75) g = 0.75;
-            if (g > 1.35) g = 1.35;
-            gain[i] = gain[i - 1] * g;
-            if (gain[i] < 0.75) gain[i] = 0.75;
-            if (gain[i] > 1.35) gain[i] = 1.35;
+            keepLeft.put(y, 0, row);
         }
-        return gain;
+        Mat lRoi = wLeft.colRange(x0, x0 + overlap);
+        Mat rRoi = wRight.colRange(x0, x0 + overlap);
+        Core.multiply(lRoi, keepLeft, lRoi);
+        Mat ones = new Mat(H, overlap, CvType.CV_32FC1, new Scalar(1.0));
+        Mat keepRight = new Mat();
+        Core.subtract(ones, keepLeft, keepRight);
+        Core.multiply(rRoi, keepRight, rRoi);
+        lRoi.release();
+        rRoi.release();
+        keepLeft.release();
+        keepRight.release();
+        ones.release();
     }
 
-    static double overlapMean(Mat bgr, boolean rightEdge, int overlap) {
-        int W = bgr.cols();
-        int H = bgr.rows();
-        int x0 = rightEdge ? W - overlap : 0;
-        int x1 = rightEdge ? W : overlap;
-        Mat roi = bgr.submat(0, H, x0, x1);
-        Mat gray = new Mat();
-        Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat mask = new Mat();
-        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
-        Scalar m = Core.mean(gray, mask);
-        roi.release();
-        gray.release();
-        mask.release();
-        return m.val[0];
+    static void blurWeights(Mat[] weights, int radius) {
+        int k = radius * 2 + 1;
+        if ((k & 1) == 0) k++;
+        for (Mat w : weights) {
+            Imgproc.GaussianBlur(w, w, new Size(k, k), radius / 2.0);
+        }
+    }
+
+    static void rezeroInvalid(Mat[] weights, Mat[] placed) {
+        for (int i = 0; i < weights.length; i++) {
+            Mat gray = new Mat();
+            Imgproc.cvtColor(placed[i], gray, Imgproc.COLOR_BGR2GRAY);
+            Mat mask = new Mat();
+            Imgproc.threshold(gray, mask, INVALID_LUMA, 1.0, Imgproc.THRESH_BINARY);
+            Mat maskF = new Mat();
+            mask.convertTo(maskF, CvType.CV_32FC1);
+            Core.multiply(weights[i], maskF, weights[i]);
+            gray.release();
+            mask.release();
+            maskF.release();
+        }
+    }
+
+    static void normalizeWeights(Mat[] weights) {
+        Mat sum = Mat.zeros(weights[0].size(), CvType.CV_32FC1);
+        for (Mat w : weights) {
+            Core.add(sum, w, sum);
+        }
+        Core.max(sum, new Scalar(1e-6), sum);
+        for (Mat w : weights) {
+            Core.divide(w, sum, w);
+        }
+        sum.release();
+    }
+
+    static Mat multibandBlend(Mat[] images, Mat[] weights, int levels) {
+        int n = images.length;
+        int h = images[0].rows();
+        int w = images[0].cols();
+        Mat[] imgF = new Mat[n];
+        for (int i = 0; i < n; i++) {
+            imgF[i] = new Mat();
+            images[i].convertTo(imgF[i], CvType.CV_32FC3);
+        }
+
+        int L = Math.max(2, levels);
+        ArrayList<ArrayList<Mat>> gauss = new ArrayList<>();
+        ArrayList<ArrayList<Mat>> wpyr = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            ArrayList<Mat> g = new ArrayList<>();
+            ArrayList<Mat> wp = new ArrayList<>();
+            g.add(imgF[i]);
+            wp.add(weights[i].clone());
+            for (int lv = 1; lv < L; lv++) {
+                Mat ng = new Mat();
+                Mat nw = new Mat();
+                Imgproc.pyrDown(g.get(lv - 1), ng);
+                Imgproc.pyrDown(wp.get(lv - 1), nw);
+                g.add(ng);
+                wp.add(nw);
+            }
+            gauss.add(g);
+            wpyr.add(wp);
+        }
+
+        Mat rec = null;
+        for (int lv = L - 1; lv >= 0; lv--) {
+            Mat acc = Mat.zeros(gauss.get(0).get(lv).size(), CvType.CV_32FC3);
+            for (int i = 0; i < n; i++) {
+                Mat lap;
+                if (lv == L - 1) {
+                    lap = gauss.get(i).get(lv);
+                } else {
+                    Mat up = new Mat();
+                    Imgproc.pyrUp(gauss.get(i).get(lv + 1), up,
+                            gauss.get(i).get(lv).size());
+                    lap = new Mat();
+                    Core.subtract(gauss.get(i).get(lv), up, lap);
+                    up.release();
+                }
+                Mat w3 = new Mat();
+                List<Mat> ch = new ArrayList<>();
+                Mat wi = wpyr.get(i).get(lv);
+                if (wi.size().width != lap.size().width
+                        || wi.size().height != lap.size().height) {
+                    Mat wr = new Mat();
+                    Imgproc.resize(wi, wr, lap.size());
+                    wi = wr;
+                }
+                ch.add(wi); ch.add(wi); ch.add(wi);
+                Core.merge(ch, w3);
+                Mat part = new Mat();
+                Core.multiply(lap, w3, part);
+                Core.add(acc, part, acc);
+                part.release();
+                w3.release();
+                if (lv != L - 1) {
+                    lap.release();
+                }
+                if (wi != wpyr.get(i).get(lv)) {
+                    wi.release();
+                }
+            }
+            if (lv == L - 1) {
+                rec = acc;
+            } else {
+                Mat up = new Mat();
+                Imgproc.pyrUp(rec, up, acc.size());
+                rec.release();
+                Core.add(up, acc, acc);
+                up.release();
+                rec = acc;
+            }
+        }
+
+        for (int i = 0; i < n; i++) {
+            for (int lv = 1; lv < L; lv++) {
+                gauss.get(i).get(lv).release();
+                wpyr.get(i).get(lv).release();
+            }
+            wpyr.get(i).get(0).release();
+            imgF[i].release();
+        }
+
+        Mat out = new Mat();
+        rec.convertTo(out, CvType.CV_8UC3);
+        rec.release();
+        return out;
     }
 
     static Path ensureDecodable(Path requested) {
