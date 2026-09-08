@@ -6,67 +6,68 @@ import java.io.File;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.Executors;
 
-import org.opencv.calib3d.Calib3d;
 import org.opencv.core.*;
 import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
 import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.Videoio;
 
+/**
+ * Multi-camera panoramic projection with a shared vehicle-frame horizon.
+ *
+ *   fisheye pixels → 3D rays → R_camera (extrinsics) → common vehicle frame
+ *        → spherical (θ, φ) → LEFT | FRONT | RIGHT | REAR canvas → feather
+ *
+ * Horizon is φ = 0 in the vehicle frame (pose), not an image-space shift.
+ * Clips are discovered in the working folder (left / front / right / rear).
+ */
 public class VideoStreamingServer {
 
-    private static final int DEFAULT_PORT  = 9090;
-    private static final int TARGET_HEIGHT = 360;
-    private static final int TARGET_WIDTH  = 640;
-    private static final int OVERLAP_PX    = 72;
-    /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
-    private static final double OUTPUT_FOV_DEG = 128.0;
-    /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
-    private static final double CROP_WIDTH_FRACTION = 0.96;
-    private static final double CROP_MAX_HEIGHT_FRACTION = 0.94;
-    /** 0 = keep the top of the remap, 1 = keep the bottom (ground). */
-    private static final double CROP_Y_BIAS = 0.50;
-    /** Drop rows/cols darker than this after remap (fisheye rim / empty map). */
-    private static final double VALID_LUMA_MIN = 14.0;
-    /** Extra inset of the valid region so the curved fisheye rim is not stretched. */
-    private static final double VALID_INSET_FRACTION = 0.015;
-    /** Horizon row in the shared output frame (fraction of height from the top). */
+    private static final int DEFAULT_PORT = 9090;
+    private static final int PANEL_WIDTH  = 640;
+    private static final int PANEL_HEIGHT = 400;
+    /** Row of the common world horizon (fraction from the top). */
     private static final double HORIZON_FRACTION = 0.40;
-    /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
-    private static final int REAR_CAMERA_INDEX = 3;
+    /** Horizontal field of each spherical panel (deg). >90 leaves overlap. */
+    private static final double PANEL_YAW_DEG = 112.0;
+    /** Vertical field around the horizon (deg). */
+    private static final double PANEL_PITCH_DEG = 72.0;
+    /** Equidistant fisheye input FOV used to build K when no calib file exists. */
+    private static final double INPUT_FISHEYE_FOV_DEG = 160.0;
+    private static final double VALID_LUMA_MIN = 12.0;
 
-    // =========================================================================
+    /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
+    private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
+    /** Pitch: negative looks toward the ground (typical bumper / wing mount). */
+    private static final double[] CAM_PITCH_DEG = { -14.0, -12.0, -14.0, -24.0 };
+    private static final double[] CAM_ROLL_DEG  = {  0.0,  0.0,  0.0,   0.0 };
+    private static final String[] CAM_ROLE      = { "left", "front", "right", "rear" };
+
     public static void main(String[] args) throws IOException {
-
-        Path leftVideo  = ensureDecodable(Paths.get("left_1.mp4"));
-        Path frontVideo = ensureDecodable(Paths.get("front_1.mp4"));
-        Path rightVideo = ensureDecodable(Paths.get("right_1.mp4"));
-        Path backVideo  = ensureDecodable(Paths.get("rear_1.mp4"));
-
-        if (args.length >= 5) {
-            leftVideo  = ensureDecodable(Paths.get(args[1]));
-            frontVideo = ensureDecodable(Paths.get(args[2]));
-            rightVideo = ensureDecodable(Paths.get(args[3]));
-            backVideo  = ensureDecodable(Paths.get(args[4]));
-        }
-
-        Path[] videos = { leftVideo, frontVideo, rightVideo, backVideo };
-
-        for (Path v : videos) {
-            if (!Files.exists(v) || Files.isDirectory(v)) {
-                System.err.println("Video file not found: " + v);
+        int port = DEFAULT_PORT;
+        if (args.length >= 1) {
+            try {
+                port = Integer.parseInt(args[0]);
+            } catch (NumberFormatException e) {
+                System.err.println("First argument must be a port number, got: " + args[0]);
                 return;
             }
         }
 
-        int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
+        Path folder = Paths.get(".").toAbsolutePath().normalize();
+        Path[] videos = discoverClips(folder);
+        if (videos == null) {
+            return;
+        }
 
         try {
             System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
@@ -77,97 +78,146 @@ public class VideoStreamingServer {
         loadFfmpegPlugin();
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-
         server.createContext("/stitch", new StitchHandler(videos));
         server.createContext("/play",   new PlayerPageHandler());
-
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
 
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
-        System.out.println("Feeds: left=" + leftVideo + " front=" + frontVideo
-                + " right=" + rightVideo + " rear=" + backVideo);
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
+                    + "  yaw=" + CAM_YAW_DEG[i]
+                    + " pitch=" + CAM_PITCH_DEG[i]
+                    + " roll=" + CAM_ROLL_DEG[i]);
+        }
     }
 
-    // STITCH HANDLER  -  undistort each feed, then feather-blend panorama
+    /**
+     * Finds left/front/right/rear clips in {@code folder}. Prefers {@code name_1.mp4}
+     * then {@code name.mp4}/{@code .mov}, then any file whose name contains the role.
+     */
+    static Path[] discoverClips(Path folder) {
+        Path[] found = new Path[4];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            found[i] = findClip(folder, CAM_ROLE[i]);
+            if (found[i] == null) {
+                System.err.println("No " + CAM_ROLE[i]
+                        + " clip in " + folder
+                        + " (expected e.g. " + CAM_ROLE[i] + "_1.mp4 or "
+                        + CAM_ROLE[i] + ".mp4)");
+                return null;
+            }
+            found[i] = ensureDecodable(found[i]);
+        }
+        return found;
+    }
+
+    static Path findClip(Path folder, String role) {
+        String r = role.toLowerCase(Locale.ROOT);
+        String[] preferred = {
+            r + "_1.mp4", r + ".mp4", r + "_1.mov", r + ".mov",
+            r + "_1.MP4", r + ".MP4"
+        };
+        for (String name : preferred) {
+            Path p = folder.resolve(name);
+            if (isUsableFile(p)) {
+                return p;
+            }
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(folder)) {
+            Path fallback = null;
+            for (Path p : stream) {
+                if (!isUsableFile(p)) continue;
+                String n = p.getFileName().toString().toLowerCase(Locale.ROOT);
+                if (!(n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".avi"))) {
+                    continue;
+                }
+                if (n.startsWith(r + "_") || n.startsWith(r + ".") || n.equals(r + ".mp4")) {
+                    return p;
+                }
+                if (fallback == null && n.contains(r)) {
+                    fallback = p;
+                }
+            }
+            return fallback;
+        } catch (IOException e) {
+            return null;
+        }
+    }
 
     private static class StitchHandler implements HttpHandler {
-      private final Path[] videoFiles;
-      StitchHandler(Path[] f) { this.videoFiles = f; }
+        private final Path[] videoFiles;
+        StitchHandler(Path[] f) { this.videoFiles = f; }
 
-      @Override public void handle(HttpExchange ex) throws IOException {
-        if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
-          ex.sendResponseHeaders(405, -1); return;
-        }
-
-        VideoCapture[] caps = new VideoCapture[videoFiles.length];
-        for (int i = 0; i < videoFiles.length; i++) {
-          caps[i] = openVideo(videoFiles[i]);
-          if (caps[i] == null || !caps[i].isOpened()) {
-            System.err.println("Could not open video: " + videoFiles[i]);
-            ex.sendResponseHeaders(500, -1); return;
-          }
-        }
-
-        CameraFeedFilter[] undistort = new CameraFeedFilter[videoFiles.length];
-        for (int i = 0; i < undistort.length; i++) {
-          undistort[i] = FisheyePanelFilter.forStitchIndex(i);
-        }
-
-        ex.getResponseHeaders().set("Content-Type", "multipart/x-mixed-replace; boundary=frame");
-        ex.sendResponseHeaders(200, 0);
-
-        try (OutputStream out = ex.getResponseBody()) {
-          Mat[] frames  = new Mat[videoFiles.length];
-          Mat[] ready   = new Mat[videoFiles.length];
-          for (int i = 0; i < videoFiles.length; i++) {
-            frames[i] = new Mat();
-            ready[i]  = new Mat();
-          }
-
-          while (true) {
-            for (int i = 0; i < caps.length; i++) {
-              if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
-                continue;
-              }
-              undistort[i].recalibrateAndFilter(frames[i], ready[i]);
+        @Override public void handle(HttpExchange ex) throws IOException {
+            if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
+                ex.sendResponseHeaders(405, -1);
+                return;
             }
 
-            boolean allReady = true;
-            for (int i = 0; i < ready.length; i++) {
-              if (ready[i].empty()
-                  || ready[i].cols() != TARGET_WIDTH
-                  || ready[i].rows() != TARGET_HEIGHT) {
-                allReady = false;
-                break;
-              }
-            }
-            if (!allReady) {
-              continue;
+            VideoCapture[] caps = new VideoCapture[videoFiles.length];
+            for (int i = 0; i < videoFiles.length; i++) {
+                caps[i] = openVideo(videoFiles[i]);
+                if (caps[i] == null || !caps[i].isOpened()) {
+                    System.err.println("Could not open video: " + videoFiles[i]);
+                    ex.sendResponseHeaders(500, -1);
+                    return;
+                }
             }
 
-            Mat panorama = featherStitch(ready);
-            writeFrame(out, encodeJpeg(panorama));
-            panorama.release();
-          }
+            SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
+            for (int i = 0; i < panels.length; i++) {
+                panels[i] = new SphericalPanel(i);
+            }
+
+            int overlap = panelOverlapPx();
+            ex.getResponseHeaders().set("Content-Type",
+                    "multipart/x-mixed-replace; boundary=frame");
+            ex.sendResponseHeaders(200, 0);
+
+            try (OutputStream out = ex.getResponseBody()) {
+                Mat[] frames = new Mat[videoFiles.length];
+                Mat[] ready  = new Mat[videoFiles.length];
+                for (int i = 0; i < videoFiles.length; i++) {
+                    frames[i] = new Mat();
+                    ready[i]  = new Mat();
+                }
+
+                while (true) {
+                    boolean allReady = true;
+                    for (int i = 0; i < caps.length; i++) {
+                        if (!readOrLoop(caps, i, videoFiles[i], frames[i])) {
+                            allReady = false;
+                            continue;
+                        }
+                        panels[i].project(frames[i], ready[i]);
+                        if (ready[i].empty()
+                                || ready[i].cols() != PANEL_WIDTH
+                                || ready[i].rows() != PANEL_HEIGHT) {
+                            allReady = false;
+                        }
+                    }
+                    if (!allReady) {
+                        continue;
+                    }
+                    Mat panorama = featherStitch(ready, overlap);
+                    writeFrame(out, encodeJpeg(panorama));
+                    panorama.release();
+                }
+            } finally {
+                for (VideoCapture c : caps) {
+                    if (c != null) c.release();
+                }
+            }
         }
-        finally {
-          for (VideoCapture c : caps) c.release();
-        }
-
-      } // handle()
-    } // StitchHandler
-
-
-    // PLAYER PAGE  -  stitched panorama only, full-viewport
+    }
 
     private static class PlayerPageHandler implements HttpHandler {
-
         @Override public void handle(HttpExchange ex) throws IOException {
             String html = "<!DOCTYPE html><html lang='en'><head>"
                 + "<meta charset='UTF-8'>"
                 + "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>360° Panoramic View</title>"
+                + "<title>Common-horizon panorama</title>"
                 + "<style>"
                 + "*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }"
                 + "html, body { height: 100%; background: #0a0a0f; color: #e0e0e0;"
@@ -175,22 +225,19 @@ public class VideoStreamingServer {
                 + ".container { display: flex; flex-direction: column;"
                 + "  align-items: center; justify-content: center;"
                 + "  height: 100vh; padding: 16px; gap: 12px; }"
-                + "h1 { font-size: 1.4rem; font-weight: 300; letter-spacing: 2px;"
+                + "h1 { font-size: 1.25rem; font-weight: 300; letter-spacing: 1px;"
                 + "  color: #7ec8e3; text-align: center; flex-shrink: 0; }"
                 + ".pano-wrap { width: 100%; flex: 1; min-height: 0;"
                 + "  border: 1px solid #2a2a3a; border-radius: 8px; overflow: hidden;"
                 + "  display: flex; align-items: center; justify-content: center; }"
                 + ".pano-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }"
-                + "</style>"
-                + "</head><body>"
+                + "</style></head><body>"
                 + "<div class='container'>"
-                + "  <h1>360° Panoramic Camera System</h1>"
+                + "  <h1>Left · Front · Right · Rear  —  common vehicle horizon</h1>"
                 + "  <div class='pano-wrap'>"
-                + "    <img src='/stitch' alt='360° stitched panorama'>"
+                + "    <img src='/stitch' alt='stitched panorama'>"
                 + "  </div>"
-                + "</div>"
-                + "</body></html>";
-
+                + "</div></body></html>";
             byte[] bytes = html.getBytes("UTF-8");
             ex.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
             ex.sendResponseHeaders(200, bytes.length);
@@ -198,437 +245,215 @@ public class VideoStreamingServer {
         }
     }
 
-
-    interface CameraFeedFilter {
-        void recalibrateAndFilter(Mat src, Mat dst360x640);
-    }
-
     /**
-     * Mount pose for one surround camera. Pitch is virtual-camera tilt in the
-     * OpenCV Y-down frame: negative looks toward the top of the raw fisheye
-     * (street instead of bumper when the lens points at the ground).
+     * One surround camera: spherical dest pixels are inverse-projected through
+     * the vehicle frame and the fisheye model into the raw frame.
      */
-    static final class PanelPose {
-        final double pitchDeg;
-        final double yawDeg;
-        final double rollDeg;
-        final double inputFovDeg;
-        final double outputFovDeg;
-
-        PanelPose(double pitchDeg, double yawDeg, double rollDeg,
-                  double inputFovDeg, double outputFovDeg) {
-            this.pitchDeg = pitchDeg;
-            this.yawDeg = yawDeg;
-            this.rollDeg = rollDeg;
-            this.inputFovDeg = inputFovDeg;
-            this.outputFovDeg = outputFovDeg;
-        }
-    }
-
-    //  UNIFIED FISHEYE PANEL
-    //
-    //  Every feed is remapped with the same output size and FOV, then cropped
-    //  to the filled rectangle (drops circular vignette) and locked onto a
-    //  shared horizon / ground band so the four panels sit on one line.
-
-    static final class FisheyePanelFilter implements CameraFeedFilter {
-
-        private static final double[] FISHEYE_D = { 0.0, 0.0, 0.0, 0.0 };
-        private static final int WORK_HEIGHT = TARGET_HEIGHT * 2;
-        private static final int WORK_WIDTH  = TARGET_WIDTH * 2;
-
-        private final PanelPose pose;
+    static final class SphericalPanel {
+        private final int index;
+        private final double[] R; // camera-to-vehicle, row-major
         private Mat map1;
         private Mat map2;
-        private Mat undistorted;
-        private Mat cropped;
-        private Mat aligned;
-        private Mat affine;
-        private Rect workCrop;
-        private Rect alignedCrop;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
-        static FisheyePanelFilter forStitchIndex(int index) {
-            final double inFov  = 160.0;
-            if (index == REAR_CAMERA_INDEX) {
-                return new FisheyePanelFilter(new PanelPose(-12.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
-            }
-            return new FisheyePanelFilter(new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
+        SphericalPanel(int index) {
+            this.index = index;
+            this.R = cameraToVehicle(CAM_YAW_DEG[index],
+                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
         }
 
-        FisheyePanelFilter(PanelPose pose) {
-            this.pose = pose;
-        }
-
-        @Override
-        public void recalibrateAndFilter(Mat src, Mat dst360x640) {
+        void project(Mat src, Mat dst) {
             if (src == null || src.empty()) {
                 return;
             }
-
             ensureMaps(src.cols(), src.rows());
-
-            if (undistorted == null) undistorted = new Mat();
-            if (cropped == null)     cropped     = new Mat();
-            if (aligned == null)     aligned     = new Mat();
-
-            Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR,
-                    Core.BORDER_CONSTANT);
-
-            if (workCrop == null) {
-                workCrop = cropWindow(undistorted);
-            }
-            Mat workRoi = undistorted.submat(workCrop);
-            Imgproc.resize(workRoi, cropped, new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    0, 0, Imgproc.INTER_AREA);
-            workRoi.release();
-
-            if (affine == null) {
-                learnGroundLock(cropped);
-            }
-
-            Imgproc.warpAffine(cropped, aligned, affine,
-                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT);
-
-            if (alignedCrop == null) {
-                alignedCrop = clampRect(
-                        aspectFit(validPixelRect(aligned), TARGET_WIDTH, TARGET_HEIGHT),
-                        aligned.cols(), aligned.rows());
-            }
-            Mat alignedRoi = aligned.submat(alignedCrop);
-            Imgproc.resize(alignedRoi, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    0, 0, Imgproc.INTER_AREA);
-            alignedRoi.release();
-            forceExactSize(dst360x640);
-        }
-
-        private void learnGroundLock(Mat panel) {
-            double roll = estimateRollDeg(panel);
-            if (Math.abs(roll) > 8.0) {
-                roll = Math.copySign(8.0, roll);
-            }
-            int horizon = estimateHorizonRow(panel);
-            int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
-            double dy = targetY - horizon;
-            double maxShift = TARGET_HEIGHT * 0.06;
-            if (dy > maxShift) dy = maxShift;
-            if (dy < -maxShift) dy = -maxShift;
-
-            Point center = new Point(TARGET_WIDTH / 2.0, TARGET_HEIGHT / 2.0);
-            affine = Imgproc.getRotationMatrix2D(center, roll, 1.0);
-            affine.put(1, 2, affine.get(1, 2)[0] + dy);
+            Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
+                    Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
         }
 
         private void ensureMaps(int srcW, int srcH) {
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
+            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
+            double cx = srcW / 2.0;
+            double cy = srcH / 2.0;
+            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
+            double yawSpan = Math.toRadians(PANEL_YAW_DEG);
+            double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
+            double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
 
-            Size dstSize = new Size(WORK_WIDTH, WORK_HEIGHT);
+            Mat mapX = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
+            Mat mapY = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
+            float[] rowX = new float[PANEL_WIDTH];
+            float[] rowY = new float[PANEL_WIDTH];
 
-            Mat K = equidistantK(srcW, srcH, pose.inputFovDeg);
-            Mat D = distortionCoeffs();
-            Mat R = eulerRyxz(pose.pitchDeg, pose.yawDeg, pose.rollDeg);
-            Mat P = pinholeK(WORK_WIDTH, WORK_HEIGHT, pose.outputFovDeg);
-            P.put(1, 2, HORIZON_FRACTION * WORK_HEIGHT);
+            for (int v = 0; v < PANEL_HEIGHT; v++) {
+                // φ = 0 on the shared horizon row; positive φ is sky (up).
+                double phi = (horizonY - v) / PANEL_HEIGHT * pitchSpan;
+                double cphi = Math.cos(phi);
+                double sphi = Math.sin(phi);
+                for (int u = 0; u < PANEL_WIDTH; u++) {
+                    double theta = yaw0 + ((u + 0.5) / PANEL_WIDTH - 0.5) * yawSpan;
+                    // Vehicle frame: X forward, Y right, Z up.
+                    double xv = cphi * Math.cos(theta);
+                    double yv = cphi * Math.sin(theta);
+                    double zv = sphi;
+                    // ray_camera = R^T * ray_vehicle  (OpenCV: X right, Y down, Z forward)
+                    double xc = R[0] * xv + R[3] * yv + R[6] * zv;
+                    double yc = R[1] * xv + R[4] * yv + R[7] * zv;
+                    double zc = R[2] * xv + R[5] * yv + R[8] * zv;
+                    if (zc <= 1e-4) {
+                        rowX[u] = -1f;
+                        rowY[u] = -1f;
+                        continue;
+                    }
+                    double inc = Math.atan2(Math.hypot(xc, yc), zc);
+                    double r = f * inc;
+                    double az = Math.atan2(yc, xc);
+                    rowX[u] = (float) (cx + r * Math.cos(az));
+                    rowY[u] = (float) (cy + r * Math.sin(az));
+                }
+                mapX.put(v, 0, rowX);
+                mapY.put(v, 0, rowY);
+            }
 
             if (map1 == null) map1 = new Mat();
             if (map2 == null) map2 = new Mat();
-
-            Calib3d.fisheye_initUndistortRectifyMap(
-                    K, D, R, P, dstSize, CvType.CV_16SC2, map1, map2);
-
+            Imgproc.convertMaps(mapX, mapY, map1, map2, CvType.CV_16SC2, false);
+            mapX.release();
+            mapY.release();
             cachedSrcW = srcW;
             cachedSrcH = srcH;
-            affine = null;
-            workCrop = null;
-            alignedCrop = null;
-
-            K.release();
-            D.release();
-            R.release();
-            P.release();
-        }
-
-        static Mat equidistantK(int width, int height, double fovDeg) {
-            double half = Math.toRadians(fovDeg) / 2.0;
-            double f = (Math.min(width, height) / 2.0) / half;
-            return matrixK(f, f, width / 2.0, height / 2.0);
-        }
-
-        static Mat pinholeK(int width, int height, double fovDeg) {
-            double half = Math.toRadians(fovDeg) / 2.0;
-            double f = (width / 2.0) / Math.tan(half);
-            return matrixK(f, f, width / 2.0, height / 2.0);
-        }
-
-        static Mat matrixK(double fx, double fy, double cx, double cy) {
-            Mat K = Mat.eye(3, 3, CvType.CV_64FC1);
-            K.put(0, 0, fx);
-            K.put(1, 1, fy);
-            K.put(0, 2, cx);
-            K.put(1, 2, cy);
-            return K;
-        }
-
-        static Mat distortionCoeffs() {
-            Mat D = new Mat(4, 1, CvType.CV_64FC1);
-            D.put(0, 0, FISHEYE_D[0]);
-            D.put(1, 0, FISHEYE_D[1]);
-            D.put(2, 0, FISHEYE_D[2]);
-            D.put(3, 0, FISHEYE_D[3]);
-            return D;
-        }
-
-        static Mat eulerRyxz(double pitchDeg, double yawDeg, double rollDeg) {
-            Mat rvec = new Mat(3, 1, CvType.CV_64FC1);
-            rvec.put(0, 0, Math.toRadians(pitchDeg));
-            rvec.put(1, 0, Math.toRadians(yawDeg));
-            rvec.put(2, 0, Math.toRadians(rollDeg));
-            Mat R = new Mat();
-            Calib3d.Rodrigues(rvec, R);
-            rvec.release();
-            return R;
         }
     }
 
+    /**
+     * R maps OpenCV camera rays to the vehicle frame:
+     *   ray_vehicle = R * ray_camera
+     * Front-looking camera (yaw=pitch=roll=0): Z_cam → X_veh, X_cam → Y_veh,
+     * -Y_cam → Z_veh.
+     */
+    static double[] cameraToVehicle(double yawDeg, double pitchDeg, double rollDeg) {
+        double[] rcv = {
+            0, 0, 1,
+            1, 0, 0,
+            0,-1, 0
+        };
+        double[] rx = rotX(Math.toRadians(rollDeg));
+        // Negative pitchDeg looks toward the ground (optical axis below the horizon).
+        double[] ry = rotY(Math.toRadians(-pitchDeg));
+        double[] rz = rotZ(Math.toRadians(yawDeg));
+        return mul3(rz, mul3(ry, mul3(rx, rcv)));
+    }
 
-    static Rect cropWindow(Mat src) {
-        Rect valid = validPixelRect(src);
-        double aspect = (double) TARGET_WIDTH / TARGET_HEIGHT;
-        int imgW = src.cols();
-        int imgH = src.rows();
+    static double[] rotX(double a) {
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[] {
+            1, 0, 0,
+            0, c,-s,
+            0, s, c
+        };
+    }
 
-        int cropW = Math.max(2, (int) Math.round(imgW * CROP_WIDTH_FRACTION));
-        int cropH = Math.max(2, (int) Math.round(cropW / aspect));
-        if (cropH > imgH * CROP_MAX_HEIGHT_FRACTION) {
-            cropH = Math.max(2, (int) Math.round(imgH * CROP_MAX_HEIGHT_FRACTION));
-            cropW = Math.max(2, (int) Math.round(cropH * aspect));
-        }
+    static double[] rotY(double a) {
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[] {
+             c, 0, s,
+             0, 1, 0,
+            -s, 0, c
+        };
+    }
 
-        cropW = Math.min(cropW, valid.width);
-        cropH = Math.min(cropH, (int) Math.round(cropW / aspect));
-        if (cropH > valid.height) {
-            cropH = valid.height;
-            cropW = Math.max(2, (int) Math.round(cropH * aspect));
-            if (cropW > valid.width) {
-                cropW = valid.width;
-                cropH = Math.max(2, (int) Math.round(cropW / aspect));
+    static double[] rotZ(double a) {
+        double c = Math.cos(a), s = Math.sin(a);
+        return new double[] {
+            c,-s, 0,
+            s, c, 0,
+            0, 0, 1
+        };
+    }
+
+    static double[] mul3(double[] a, double[] b) {
+        double[] c = new double[9];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                c[i * 3 + j] = a[i * 3] * b[j]
+                        + a[i * 3 + 1] * b[3 + j]
+                        + a[i * 3 + 2] * b[6 + j];
             }
         }
-
-        int x = valid.x + (valid.width - cropW) / 2;
-        int y = valid.y + (int) Math.round((valid.height - cropH) * CROP_Y_BIAS);
-        x = Math.max(0, Math.min(x, imgW - cropW));
-        y = Math.max(0, Math.min(y, imgH - cropH));
-        return new Rect(x, y, cropW, cropH);
+        return c;
     }
 
-    static Rect aspectFit(Rect valid, int targetW, int targetH) {
-        double aspect = (double) targetW / targetH;
-        int w = valid.width;
-        int h = valid.height;
-        if ((double) w / h > aspect) {
-            w = Math.max(2, (int) Math.round(h * aspect));
-        } else {
-            h = Math.max(2, (int) Math.round(w / aspect));
-        }
-        int x = valid.x + (valid.width - w) / 2;
-        int y = valid.y + (valid.height - h) / 2;
-        return new Rect(x, y, w, h);
+    static double fisheyeFocal(int width, int height, double fovDeg) {
+        double half = Math.toRadians(fovDeg) / 2.0;
+        return (Math.min(width, height) / 2.0) / half;
     }
 
-    static Rect clampRect(Rect r, int imgW, int imgH) {
-        int x = Math.max(0, r.x);
-        int y = Math.max(0, r.y);
-        int w = r.width;
-        int h = r.height;
-        if (x + w > imgW) w = imgW - x;
-        if (y + h > imgH) h = imgH - y;
-        if (w < 1) w = 1;
-        if (h < 1) h = 1;
-        return new Rect(x, y, w, h);
+    static int panelOverlapPx() {
+        double spacing = 90.0;
+        double overlapDeg = PANEL_YAW_DEG - spacing;
+        if (overlapDeg < 4.0) overlapDeg = 4.0;
+        int px = (int) Math.round(overlapDeg / PANEL_YAW_DEG * PANEL_WIDTH);
+        return Math.max(16, Math.min(PANEL_WIDTH / 3, px));
     }
 
-    /** Filled pixels only, inset so the circular fisheye rim is not stretched. */
-    static Rect validPixelRect(Mat bgr) {
-        int imgW = bgr.cols();
-        int imgH = bgr.rows();
-        Mat gray = new Mat();
-        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat mask = new Mat();
-        Imgproc.threshold(gray, mask, VALID_LUMA_MIN, 255, Imgproc.THRESH_BINARY);
-
-        int k = Math.max(7, Math.min(imgW, imgH) / 48);
-        if ((k & 1) == 0) {
-            k++;
-        }
-        Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(k, k));
-        Imgproc.erode(mask, mask, kernel);
-
-        Rect box = Imgproc.boundingRect(mask);
-        gray.release();
-        mask.release();
-        kernel.release();
-
-        if (box.width < imgW / 5 || box.height < imgH / 5) {
-            int padX = (int) Math.round(imgW * 0.08);
-            int padY = (int) Math.round(imgH * 0.10);
-            return new Rect(padX, padY, Math.max(2, imgW - 2 * padX), Math.max(2, imgH - 2 * padY));
-        }
-
-        int insetX = Math.max(2, (int) Math.round(box.width * VALID_INSET_FRACTION));
-        int insetY = Math.max(2, (int) Math.round(box.height * VALID_INSET_FRACTION));
-        int x = box.x + insetX;
-        int y = box.y + insetY;
-        int w = box.width - 2 * insetX;
-        int h = box.height - 2 * insetY;
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-        if (x + w > imgW) w = imgW - x;
-        if (y + h > imgH) h = imgH - y;
-        if (w < 2 || h < 2) {
-            return new Rect(0, 0, imgW, imgH);
-        }
-        return new Rect(x, y, w, h);
-    }
-
-    static int estimateHorizonRow(Mat bgr) {
-        Mat gray = new Mat();
-        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Imgproc.GaussianBlur(gray, gray, new Size(9, 9), 1.4);
-        Mat sobel = new Mat();
-        Imgproc.Sobel(gray, sobel, CvType.CV_32F, 0, 1, 3);
-        Mat mag = new Mat();
-        Core.convertScaleAbs(sobel, mag);
-        sobel.release();
-        sobel = mag;
-
-        int h = gray.rows();
-        int w = gray.cols();
-        int x0 = w / 5;
-        int x1 = w - w / 5;
-        int y0 = Math.max(1, (int) (h * 0.14));
-        int y1 = Math.max(y0 + 1, (int) (h * 0.62));
-        int fallback = (int) Math.round(HORIZON_FRACTION * h);
-
-        double best = -1;
-        int bestY = fallback;
-        for (int y = y0; y < y1; y++) {
-            double s = Core.sumElems(sobel.row(y).colRange(x0, x1)).val[0];
-            if (s > best) {
-                best = s;
-                bestY = y;
-            }
-        }
-        gray.release();
-        sobel.release();
-        return bestY;
-    }
-
-    static double estimateRollDeg(Mat bgr) {
-        Mat gray = new Mat();
-        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Imgproc.Canny(gray, gray, 55, 150);
-        Mat lines = new Mat();
-        Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 55, 48, 12);
-        ArrayList<Double> angles = new ArrayList<>();
-        for (int i = 0; i < lines.rows(); i++) {
-            double[] l = lines.get(i, 0);
-            if (l == null || l.length < 4) continue;
-            double ang = Math.toDegrees(Math.atan2(l[3] - l[1], l[2] - l[0]));
-            while (ang > 90)  ang -= 180;
-            while (ang < -90) ang += 180;
-            if (Math.abs(ang) <= 22) {
-                angles.add(ang);
-            }
-        }
-        gray.release();
-        lines.release();
-        if (angles.size() < 4) {
-            return 0.0;
-        }
-        java.util.Collections.sort(angles);
-        return angles.get(angles.size() / 2);
-    }
-
-    static void forceExactSize(Mat img) {
-        if (img.cols() == TARGET_WIDTH && img.rows() == TARGET_HEIGHT) {
-            return;
-        }
-        Mat tmp = new Mat();
-        Imgproc.resize(img, tmp, new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
-        tmp.copyTo(img);
-        tmp.release();
-    }
-
-
-    //  CORE BLENDING  —  featherStitch
-
-    static Mat featherStitch(Mat[] frames) {
+    static Mat featherStitch(Mat[] frames, int overlap) {
         int N = frames.length;
-        int H = TARGET_HEIGHT;
-        int W = TARGET_WIDTH;
-
-        int overlap = Math.min(OVERLAP_PX, W / 4);
-        int panoW   = W + (N - 1) * (W - overlap);
+        int H = PANEL_HEIGHT;
+        int W = PANEL_WIDTH;
+        int panoW = W + (N - 1) * (W - overlap);
 
         Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
         Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
-            forceExactSize(frames[i]);
             int xStart = i * (W - overlap);
-
             Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
+            multiplyByValidLuma(frames[i], weight);
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
-
             Mat weight3 = new Mat();
             List<Mat> ch = new ArrayList<>();
             ch.add(weight); ch.add(weight); ch.add(weight);
             Core.merge(ch, weight3);
-
             Mat wFrame = new Mat();
             Core.multiply(frameF, weight3, wFrame);
 
-            int xEnd    = Math.min(xStart + W, panoW);
+            int xEnd = Math.min(xStart + W, panoW);
             int wActual = xEnd - xStart;
-
             Mat colorRoi  = accumColor.submat(0, H, xStart, xEnd);
             Mat weightRoi = accumWeight.submat(0, H, xStart, xEnd);
+            Core.add(colorRoi,  wFrame.colRange(0, wActual), colorRoi);
+            Core.add(weightRoi, weight.colRange(0, wActual), weightRoi);
 
-            Mat wFrameCrop = wFrame.colRange(0, wActual);
-            Mat weightCrop = weight.colRange(0, wActual);
-
-            Core.add(colorRoi,  wFrameCrop, colorRoi);
-            Core.add(weightRoi, weightCrop, weightRoi);
-
-            colorRoi.release(); weightRoi.release();
-            frameF.release(); weight.release(); weight3.release();
+            colorRoi.release();
+            weightRoi.release();
+            frameF.release();
+            weight.release();
+            weight3.release();
             wFrame.release();
         }
 
         Mat safeW = new Mat();
         Core.max(accumWeight, new Scalar(1e-6), safeW);
-
         Mat safeW3 = new Mat();
         List<Mat> wch = new ArrayList<>();
         wch.add(safeW); wch.add(safeW); wch.add(safeW);
         Core.merge(wch, safeW3);
-
         Mat blended = new Mat();
         Core.divide(accumColor, safeW3, blended);
-
         Mat result = new Mat();
         blended.convertTo(result, CvType.CV_8UC3);
 
-        accumColor.release(); accumWeight.release();
-        safeW.release(); safeW3.release(); blended.release();
-
+        accumColor.release();
+        accumWeight.release();
+        safeW.release();
+        safeW3.release();
+        blended.release();
         return result;
     }
 
@@ -638,7 +463,7 @@ public class VideoStreamingServer {
             return mask;
         }
         for (int x = 0; x < overlap; x++) {
-            float alpha = (float) x / overlap;
+            float alpha = (float) (0.5 - 0.5 * Math.cos(Math.PI * x / overlap));
             if (fadeLeft) {
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
@@ -653,23 +478,28 @@ public class VideoStreamingServer {
         return mask;
     }
 
-
-    // VIDEO IO  —  FFmpeg plugin, then MSMF without RGB32 conversion
-
-    static Path preferH264(Path requested) {
-        return ensureDecodable(requested);
+    static void multiplyByValidLuma(Mat bgr, Mat weight) {
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat valid = new Mat();
+        Imgproc.threshold(gray, valid, VALID_LUMA_MIN, 1.0, Imgproc.THRESH_BINARY);
+        Mat validF = new Mat();
+        valid.convertTo(validF, CvType.CV_32FC1);
+        Core.multiply(weight, validF, weight);
+        gray.release();
+        valid.release();
+        validF.release();
     }
 
-    /**
-     * These camera .mov files are PNG video (FFmpeg codec_id=61, fourcc png).
-     * OpenCV's bundled FFmpeg and Windows MSMF cannot decode that.
-     * Use a sibling H.264 .mp4, transcoding with ffmpeg when needed.
-     */
     static Path ensureDecodable(Path requested) {
         Path mp4 = siblingWithExt(requested, ".mp4");
         if (isUsableFile(mp4)) {
-            System.out.println("Using " + mp4.getFileName() + " (H.264) instead of "
-                    + requested.getFileName());
+            Path a = mp4.toAbsolutePath().normalize();
+            Path b = requested.toAbsolutePath().normalize();
+            if (!a.equals(b)) {
+                System.out.println("Using " + mp4.getFileName() + " (H.264) instead of "
+                        + requested.getFileName());
+            }
             return mp4;
         }
         if (!isUsableFile(requested)) {
@@ -733,11 +563,6 @@ public class VideoStreamingServer {
         return false;
     }
 
-    /**
-     * Official Windows OpenCV puts opencv_java*.dll in build/java/x64 and the
-     * FFmpeg videoio plugin in build/bin. java.library.path usually only has
-     * the first folder, so MSMF is used and .mov RGB32 decode fails.
-     */
     static void loadFfmpegPlugin() {
         String[] dllNames = {
             "opencv_videoio_ffmpeg490_64.dll",
@@ -780,14 +605,8 @@ public class VideoStreamingServer {
 
     static VideoCapture openVideo(Path path) {
         String file = path.toAbsolutePath().toString();
-
-        int[] apis = {
-            Videoio.CAP_FFMPEG,
-            Videoio.CAP_ANY,
-            Videoio.CAP_MSMF
-        };
+        int[] apis = { Videoio.CAP_FFMPEG, Videoio.CAP_ANY, Videoio.CAP_MSMF };
         String[] labels = { "FFMPEG", "ANY", "MSMF" };
-
         for (int a = 0; a < apis.length; a++) {
             for (double convert : new double[]{ (apis[a] == Videoio.CAP_MSMF ? 0 : 1), 0, 1 }) {
                 VideoCapture cap = tryOpen(file, apis[a], labels[a], convert);
@@ -796,7 +615,6 @@ public class VideoStreamingServer {
                 }
             }
         }
-
         VideoCapture cap = new VideoCapture();
         cap.open(file);
         if (cap.isOpened()) {
@@ -826,7 +644,6 @@ public class VideoStreamingServer {
             return null;
         }
         params.release();
-
         cap.set(Videoio.CAP_PROP_CONVERT_RGB, convertRgb);
         if (!probeFrame(cap)) {
             cap.release();
@@ -922,21 +739,18 @@ public class VideoStreamingServer {
         if (readBgr(caps[i], frame)) {
             return true;
         }
-
         caps[i].set(Videoio.CAP_PROP_POS_FRAMES, 0);
         caps[i].set(Videoio.CAP_PROP_POS_MSEC, 0);
         if (readBgr(caps[i], frame)) {
             System.out.println("Video " + i + " looped via seek");
             return true;
         }
-
         caps[i].release();
         caps[i] = openVideo(path);
-        if (readBgr(caps[i], frame)) {
+        if (caps[i] != null && readBgr(caps[i], frame)) {
             System.out.println("Video " + i + " reopened after loop");
             return true;
         }
-
         System.err.println("Warning: Could not read frame from video " + i);
         return false;
     }
