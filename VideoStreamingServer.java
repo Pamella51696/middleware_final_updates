@@ -25,7 +25,13 @@ public class VideoStreamingServer {
     private static final int DEFAULT_PORT  = 9090;
     private static final int TARGET_HEIGHT = 360;
     private static final int TARGET_WIDTH  = 640;
-    private static final int OVERLAP_PX    = 72;
+    /**
+     * Shared panorama height. Panels are rotated/shifted onto this canvas so a
+     * common horizon can sit on one row; empty corners stay black.
+     */
+    private static final int ALIGNED_HEIGHT = 540;
+    /** Horizontal overlap between adjacent panels (wider = more blended seams). */
+    private static final int OVERLAP_PX    = 168;
     /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
     private static final double OUTPUT_FOV_DEG = 128.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
@@ -38,9 +44,13 @@ public class VideoStreamingServer {
     /** Extra inset of the valid region so the curved fisheye rim is not stretched. */
     private static final double VALID_INSET_FRACTION = 0.015;
     /** Horizon row in the shared output frame (fraction of height from the top). */
-    private static final double HORIZON_FRACTION = 0.40;
+    private static final double HORIZON_FRACTION = 0.38;
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
     private static final int REAR_CAMERA_INDEX = 3;
+    /** Max corrective roll when a camera is physically tilted (rear often is). */
+    private static final double MAX_ROLL_DEG = 40.0;
+    /** Max vertical shift as a fraction of the rectified panel height. */
+    private static final double MAX_HORIZON_SHIFT_FRACTION = 0.42;
 
     // =========================================================================
     public static void main(String[] args) throws IOException {
@@ -93,6 +103,7 @@ public class VideoStreamingServer {
 
     private static class StitchHandler implements HttpHandler {
       private final Path[] videoFiles;
+      private double[] seamDy;
       StitchHandler(Path[] f) { this.videoFiles = f; }
 
       @Override public void handle(HttpExchange ex) throws IOException {
@@ -137,7 +148,7 @@ public class VideoStreamingServer {
             for (int i = 0; i < ready.length; i++) {
               if (ready[i].empty()
                   || ready[i].cols() != TARGET_WIDTH
-                  || ready[i].rows() != TARGET_HEIGHT) {
+                  || ready[i].rows() != ALIGNED_HEIGHT) {
                 allReady = false;
                 break;
               }
@@ -146,7 +157,16 @@ public class VideoStreamingServer {
               continue;
             }
 
-            Mat panorama = featherStitch(ready);
+            if (seamDy == null) {
+              seamDy = estimatePairwiseDy(ready);
+            }
+            Mat[] aligned = applyVerticalShifts(ready, seamDy);
+            Mat panorama = featherStitch(aligned);
+            if (aligned != ready) {
+              for (Mat m : aligned) {
+                m.release();
+              }
+            }
             writeFrame(out, encodeJpeg(panorama));
             panorama.release();
           }
@@ -228,8 +248,9 @@ public class VideoStreamingServer {
     //  UNIFIED FISHEYE PANEL
     //
     //  Every feed is remapped with the same output size and FOV, then cropped
-    //  to the filled rectangle (drops circular vignette) and locked onto a
-    //  shared horizon / ground band so the four panels sit on one line.
+    //  to the filled rectangle (drops circular vignette). Each panel is then
+    //  rotated and shifted onto a shared canvas so one horizon line is common;
+    //  empty regions stay black. Adjacent panels are feather-blended.
 
     static final class FisheyePanelFilter implements CameraFeedFilter {
 
@@ -245,14 +266,13 @@ public class VideoStreamingServer {
         private Mat aligned;
         private Mat affine;
         private Rect workCrop;
-        private Rect alignedCrop;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
         static FisheyePanelFilter forStitchIndex(int index) {
             final double inFov  = 160.0;
             if (index == REAR_CAMERA_INDEX) {
-                return new FisheyePanelFilter(new PanelPose(-12.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
+                return new FisheyePanelFilter(new PanelPose(-14.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
             }
             return new FisheyePanelFilter(new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
         }
@@ -274,7 +294,7 @@ public class VideoStreamingServer {
             if (aligned == null)     aligned     = new Mat();
 
             Imgproc.remap(src, undistorted, map1, map2, Imgproc.INTER_LINEAR,
-                    Core.BORDER_CONSTANT);
+                    Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
 
             if (workCrop == null) {
                 workCrop = cropWindow(undistorted);
@@ -288,37 +308,40 @@ public class VideoStreamingServer {
                 learnGroundLock(cropped);
             }
 
+            // Rotate/translate onto the shared canvas. Do not recrop: empty
+            // corners from the correction stay black so the horizon stays locked.
             Imgproc.warpAffine(cropped, aligned, affine,
-                    new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT);
-
-            if (alignedCrop == null) {
-                alignedCrop = clampRect(
-                        aspectFit(validPixelRect(aligned), TARGET_WIDTH, TARGET_HEIGHT),
-                        aligned.cols(), aligned.rows());
-            }
-            Mat alignedRoi = aligned.submat(alignedCrop);
-            Imgproc.resize(alignedRoi, dst360x640, new Size(TARGET_WIDTH, TARGET_HEIGHT),
-                    0, 0, Imgproc.INTER_AREA);
-            alignedRoi.release();
-            forceExactSize(dst360x640);
+                    new Size(TARGET_WIDTH, ALIGNED_HEIGHT),
+                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+            aligned.copyTo(dst360x640);
+            forceExactSize(dst360x640, TARGET_WIDTH, ALIGNED_HEIGHT);
         }
 
         private void learnGroundLock(Mat panel) {
             double roll = estimateRollDeg(panel);
-            if (Math.abs(roll) > 8.0) {
-                roll = Math.copySign(8.0, roll);
+            if (Math.abs(roll) > MAX_ROLL_DEG) {
+                roll = Math.copySign(MAX_ROLL_DEG, roll);
             }
-            int horizon = estimateHorizonRow(panel);
-            int targetY = (int) Math.round(HORIZON_FRACTION * TARGET_HEIGHT);
+
+            Point center = new Point(panel.cols() / 2.0, panel.rows() / 2.0);
+            Mat rot = Imgproc.getRotationMatrix2D(center, roll, 1.0);
+            Mat leveled = new Mat();
+            Imgproc.warpAffine(panel, leveled, rot,
+                    new Size(panel.cols(), panel.rows()),
+                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+
+            int horizon = estimateHorizonRow(leveled);
+            int targetY = (int) Math.round(HORIZON_FRACTION * ALIGNED_HEIGHT);
             double dy = targetY - horizon;
-            double maxShift = TARGET_HEIGHT * 0.06;
+            double maxShift = TARGET_HEIGHT * MAX_HORIZON_SHIFT_FRACTION;
             if (dy > maxShift) dy = maxShift;
             if (dy < -maxShift) dy = -maxShift;
 
-            Point center = new Point(TARGET_WIDTH / 2.0, TARGET_HEIGHT / 2.0);
-            affine = Imgproc.getRotationMatrix2D(center, roll, 1.0);
+            affine = rot;
+            affine.put(0, 2, affine.get(0, 2)[0]
+                    + (TARGET_WIDTH - panel.cols()) / 2.0);
             affine.put(1, 2, affine.get(1, 2)[0] + dy);
+            leveled.release();
         }
 
         private void ensureMaps(int srcW, int srcH) {
@@ -344,7 +367,6 @@ public class VideoStreamingServer {
             cachedSrcH = srcH;
             affine = null;
             workCrop = null;
-            alignedCrop = null;
 
             K.release();
             D.release();
@@ -508,15 +530,41 @@ public class VideoStreamingServer {
 
         int h = gray.rows();
         int w = gray.cols();
-        int x0 = w / 5;
-        int x1 = w - w / 5;
-        int y0 = Math.max(1, (int) (h * 0.14));
-        int y1 = Math.max(y0 + 1, (int) (h * 0.62));
+        int x0 = w / 6;
+        int x1 = w - w / 6;
+        int y0 = Math.max(1, (int) (h * 0.10));
+        int y1 = Math.max(y0 + 1, (int) (h * 0.70));
         int fallback = (int) Math.round(HORIZON_FRACTION * h);
+        int minValid = Math.max(8, (int) ((x1 - x0) * 0.40));
 
         double best = -1;
         int bestY = fallback;
         for (int y = y0; y < y1; y++) {
+            Mat rowGray = gray.row(y).colRange(x0, x1);
+            Mat valid = new Mat();
+            Imgproc.threshold(rowGray, valid, VALID_LUMA_MIN, 1, Imgproc.THRESH_BINARY);
+            int filled = Core.countNonZero(valid);
+            valid.release();
+            if (filled < minValid) {
+                continue;
+            }
+            // Skip the black-to-content border created by rotation; the true
+            // horizon has filled pixels both above and below.
+            int yAbove = Math.max(0, y - 6);
+            int yBelow = Math.min(h - 1, y + 6);
+            Mat above = gray.row(yAbove).colRange(x0, x1);
+            Mat below = gray.row(yBelow).colRange(x0, x1);
+            Mat va = new Mat();
+            Mat vb = new Mat();
+            Imgproc.threshold(above, va, VALID_LUMA_MIN, 1, Imgproc.THRESH_BINARY);
+            Imgproc.threshold(below, vb, VALID_LUMA_MIN, 1, Imgproc.THRESH_BINARY);
+            int filledA = Core.countNonZero(va);
+            int filledB = Core.countNonZero(vb);
+            va.release();
+            vb.release();
+            if (filledA < minValid || filledB < minValid) {
+                continue;
+            }
             double s = Core.sumElems(sobel.row(y).colRange(x0, x1)).val[0];
             if (s > best) {
                 best = s;
@@ -531,35 +579,64 @@ public class VideoStreamingServer {
     static double estimateRollDeg(Mat bgr) {
         Mat gray = new Mat();
         Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Imgproc.Canny(gray, gray, 55, 150);
+        Imgproc.GaussianBlur(gray, gray, new Size(5, 5), 1.0);
+        Imgproc.Canny(gray, gray, 45, 140);
         Mat lines = new Mat();
-        Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 55, 48, 12);
-        ArrayList<Double> angles = new ArrayList<>();
+        int minLen = Math.max(36, bgr.cols() / 7);
+        Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 40, minLen, 14);
+        ArrayList<double[]> scored = new ArrayList<>();
         for (int i = 0; i < lines.rows(); i++) {
             double[] l = lines.get(i, 0);
             if (l == null || l.length < 4) continue;
             double ang = Math.toDegrees(Math.atan2(l[3] - l[1], l[2] - l[0]));
             while (ang > 90)  ang -= 180;
             while (ang < -90) ang += 180;
-            if (Math.abs(ang) <= 22) {
-                angles.add(ang);
+            if (Math.abs(ang) > MAX_ROLL_DEG + 8) {
+                continue;
             }
+            double length = Math.hypot(l[2] - l[0], l[3] - l[1]);
+            scored.add(new double[]{ ang, length });
         }
         gray.release();
         lines.release();
-        if (angles.size() < 4) {
+        if (scored.size() < 4) {
             return 0.0;
         }
+        scored.sort((a, b) -> Double.compare(b[1], a[1]));
+        int keep = Math.max(6, scored.size() / 2);
+        if (keep > scored.size()) keep = scored.size();
+        ArrayList<Double> angles = new ArrayList<>();
+        for (int i = 0; i < keep; i++) {
+            angles.add(scored.get(i)[0]);
+        }
         java.util.Collections.sort(angles);
-        return angles.get(angles.size() / 2);
+        double median = angles.get(angles.size() / 2);
+        ArrayList<Double> clustered = new ArrayList<>();
+        for (double a : angles) {
+            if (Math.abs(a - median) <= 14.0) {
+                clustered.add(a);
+            }
+        }
+        if (clustered.size() >= 3) {
+            java.util.Collections.sort(clustered);
+            median = clustered.get(clustered.size() / 2);
+        }
+        if (Math.abs(median) < 1.5) {
+            return 0.0;
+        }
+        return median;
     }
 
     static void forceExactSize(Mat img) {
-        if (img.cols() == TARGET_WIDTH && img.rows() == TARGET_HEIGHT) {
+        forceExactSize(img, TARGET_WIDTH, TARGET_HEIGHT);
+    }
+
+    static void forceExactSize(Mat img, int width, int height) {
+        if (img.cols() == width && img.rows() == height) {
             return;
         }
         Mat tmp = new Mat();
-        Imgproc.resize(img, tmp, new Size(TARGET_WIDTH, TARGET_HEIGHT), 0, 0, Imgproc.INTER_AREA);
+        Imgproc.resize(img, tmp, new Size(width, height), 0, 0, Imgproc.INTER_AREA);
         tmp.copyTo(img);
         tmp.release();
     }
@@ -569,20 +646,21 @@ public class VideoStreamingServer {
 
     static Mat featherStitch(Mat[] frames) {
         int N = frames.length;
-        int H = TARGET_HEIGHT;
+        int H = frames[0].rows();
         int W = TARGET_WIDTH;
 
-        int overlap = Math.min(OVERLAP_PX, W / 4);
+        int overlap = Math.min(OVERLAP_PX, W / 3);
         int panoW   = W + (N - 1) * (W - overlap);
 
         Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
         Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
-            forceExactSize(frames[i]);
+            forceExactSize(frames[i], W, H);
             int xStart = i * (W - overlap);
 
             Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
+            multiplyByValidLuma(frames[i], weight);
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
@@ -638,7 +716,7 @@ public class VideoStreamingServer {
             return mask;
         }
         for (int x = 0; x < overlap; x++) {
-            float alpha = (float) x / overlap;
+            float alpha = (float) (0.5 - 0.5 * Math.cos(Math.PI * x / overlap));
             if (fadeLeft) {
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
@@ -651,6 +729,112 @@ public class VideoStreamingServer {
             }
         }
         return mask;
+    }
+
+    /** Keep black letterbox from contributing to the blend (avoids dark seams). */
+    static void multiplyByValidLuma(Mat bgr, Mat weight) {
+        Mat gray = new Mat();
+        Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat valid = new Mat();
+        Imgproc.threshold(gray, valid, VALID_LUMA_MIN, 1.0, Imgproc.THRESH_BINARY);
+        Mat validF = new Mat();
+        valid.convertTo(validF, CvType.CV_32FC1);
+        Core.multiply(weight, validF, weight);
+        gray.release();
+        valid.release();
+        validF.release();
+    }
+
+    /**
+     * Residual vertical registration in the overlap so objects that straddle a
+     * seam (e.g. the yellow car between right and rear) sit on one line.
+     */
+    static double[] estimatePairwiseDy(Mat[] frames) {
+        int N = frames.length;
+        double[] dy = new double[N];
+        int overlap = Math.min(OVERLAP_PX, TARGET_WIDTH / 3);
+        double maxStep = TARGET_HEIGHT * 0.22;
+        for (int i = 0; i < N - 1; i++) {
+            Point shift = overlapShift(frames[i], frames[i + 1], overlap);
+            if (shift != null && Math.abs(shift.y) <= maxStep) {
+                dy[i + 1] = dy[i] - shift.y;
+            } else {
+                dy[i + 1] = dy[i];
+            }
+        }
+        double mean = 0;
+        for (double v : dy) mean += v;
+        mean /= N;
+        for (int i = 0; i < N; i++) {
+            dy[i] -= mean;
+        }
+        return dy;
+    }
+
+    static Point overlapShift(Mat left, Mat right, int overlap) {
+        if (left.empty() || right.empty() || overlap < 16) {
+            return null;
+        }
+        int H = Math.min(left.rows(), right.rows());
+        int W = Math.min(left.cols(), right.cols());
+        int y0 = (int) (H * 0.18);
+        int y1 = (int) (H * 0.82);
+        if (y1 - y0 < 24 || W < overlap) {
+            return null;
+        }
+        Mat a = left.submat(y0, y1, W - overlap, W);
+        Mat b = right.submat(y0, y1, 0, overlap);
+        Mat ga = new Mat();
+        Mat gb = new Mat();
+        Imgproc.cvtColor(a, ga, Imgproc.COLOR_BGR2GRAY);
+        Imgproc.cvtColor(b, gb, Imgproc.COLOR_BGR2GRAY);
+        Mat fa = new Mat();
+        Mat fb = new Mat();
+        ga.convertTo(fa, CvType.CV_32FC1);
+        gb.convertTo(fb, CvType.CV_32FC1);
+        if (Core.mean(fa).val[0] < 18 || Core.mean(fb).val[0] < 18) {
+            a.release(); b.release();
+            ga.release(); gb.release();
+            fa.release(); fb.release();
+            return null;
+        }
+        Mat win = new Mat();
+        Imgproc.createHanningWindow(win, fa.size(), CvType.CV_32FC1);
+        Point shift = Core.phaseCorrelate(fa, fb, win);
+        a.release(); b.release();
+        ga.release(); gb.release();
+        fa.release(); fb.release();
+        win.release();
+        return shift;
+    }
+
+    static Mat[] applyVerticalShifts(Mat[] frames, double[] dy) {
+        if (dy == null) {
+            return frames;
+        }
+        boolean any = false;
+        for (double v : dy) {
+            if (Math.abs(v) > 0.5) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return frames;
+        }
+        Mat[] out = new Mat[frames.length];
+        for (int i = 0; i < frames.length; i++) {
+            Mat M = Mat.zeros(2, 3, CvType.CV_64FC1);
+            M.put(0, 0, 1);
+            M.put(1, 1, 1);
+            M.put(1, 2, dy[i]);
+            out[i] = new Mat();
+            Imgproc.warpAffine(frames[i], out[i], M,
+                    new Size(frames[i].cols(), frames[i].rows()),
+                    Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
+            M.release();
+        }
+        return out;
     }
 
 
