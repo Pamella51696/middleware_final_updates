@@ -30,8 +30,10 @@ public class VideoStreamingServer {
      * common horizon can sit on one row; empty corners stay black.
      */
     private static final int ALIGNED_HEIGHT = 540;
-    /** Horizontal overlap between adjacent panels (wider = more blended seams). */
-    private static final int OVERLAP_PX    = 168;
+    /** Horizontal overlap between adjacent panels. */
+    private static final int OVERLAP_PX    = 152;
+    /** Soft fade distance from each panel's valid content edge (px). */
+    private static final int EDGE_FEATHER_PX = 80;
     /** Horizontal FOV of each rectified panel. Higher = more zoomed out. */
     private static final double OUTPUT_FOV_DEG = 128.0;
     /** Keep this fraction of the remapped frame (1.0 = no extra zoom crop). */
@@ -48,9 +50,15 @@ public class VideoStreamingServer {
     /** Last stitch panel — rear camera (bumper at bottom of raw fisheye). */
     private static final int REAR_CAMERA_INDEX = 3;
     /** Max corrective roll when a camera is physically tilted (rear often is). */
-    private static final double MAX_ROLL_DEG = 40.0;
-    /** Max vertical shift as a fraction of the rectified panel height. */
-    private static final double MAX_HORIZON_SHIFT_FRACTION = 0.42;
+    private static final double MAX_ROLL_DEG = 32.0;
+    /** Side cameras: perspective road lines look like roll — keep this small. */
+    private static final double MAX_ROLL_SIDE_DEG = 4.5;
+    /** Max extra vertical nudge toward the shared horizon (side cameras). */
+    private static final double MAX_HORIZON_NUDGE_SIDE = 20.0;
+    /** Rear camera may sit much higher/lower after leveling. */
+    private static final double MAX_HORIZON_NUDGE_REAR = 90.0;
+    /** Max residual pairwise shift from overlap matching. */
+    private static final double MAX_SEAM_DY = 70.0;
 
     // =========================================================================
     public static void main(String[] args) throws IOException {
@@ -271,13 +279,19 @@ public class VideoStreamingServer {
 
         static FisheyePanelFilter forStitchIndex(int index) {
             final double inFov  = 160.0;
+            PanelPose pose;
             if (index == REAR_CAMERA_INDEX) {
-                return new FisheyePanelFilter(new PanelPose(-14.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
+                pose = new PanelPose(-14.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG);
+            } else {
+                pose = new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG);
             }
-            return new FisheyePanelFilter(new PanelPose(-6.0, 0.0, 0.0, inFov, OUTPUT_FOV_DEG));
+            return new FisheyePanelFilter(index, pose);
         }
 
-        FisheyePanelFilter(PanelPose pose) {
+        private final int stitchIndex;
+
+        FisheyePanelFilter(int stitchIndex, PanelPose pose) {
+            this.stitchIndex = stitchIndex;
             this.pose = pose;
         }
 
@@ -318,10 +332,9 @@ public class VideoStreamingServer {
         }
 
         private void learnGroundLock(Mat panel) {
-            double roll = estimateRollDeg(panel);
-            if (Math.abs(roll) > MAX_ROLL_DEG) {
-                roll = Math.copySign(MAX_ROLL_DEG, roll);
-            }
+            boolean rear = stitchIndex == REAR_CAMERA_INDEX;
+            double maxRoll = rear ? MAX_ROLL_DEG : MAX_ROLL_SIDE_DEG;
+            double roll = estimateRollDeg(panel, maxRoll);
 
             Point center = new Point(panel.cols() / 2.0, panel.rows() / 2.0);
             Mat rot = Imgproc.getRotationMatrix2D(center, roll, 1.0);
@@ -330,17 +343,22 @@ public class VideoStreamingServer {
                     new Size(panel.cols(), panel.rows()),
                     Imgproc.INTER_LINEAR, Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
 
+            // Keep every panel on the same vertical band, then nudge toward
+            // the shared horizon. Large independent shifts caused the zigzag.
+            double ty = (ALIGNED_HEIGHT - panel.rows()) / 2.0;
             int horizon = estimateHorizonRow(leveled);
-            int targetY = (int) Math.round(HORIZON_FRACTION * ALIGNED_HEIGHT);
-            double dy = targetY - horizon;
-            double maxShift = TARGET_HEIGHT * MAX_HORIZON_SHIFT_FRACTION;
-            if (dy > maxShift) dy = maxShift;
-            if (dy < -maxShift) dy = -maxShift;
+            double hzOnCanvas = ty + horizon;
+            double targetY = HORIZON_FRACTION * ALIGNED_HEIGHT;
+            double nudge = targetY - hzOnCanvas;
+            double maxNudge = rear ? MAX_HORIZON_NUDGE_REAR : MAX_HORIZON_NUDGE_SIDE;
+            if (nudge > maxNudge) nudge = maxNudge;
+            if (nudge < -maxNudge) nudge = -maxNudge;
+            ty += nudge;
 
             affine = rot;
             affine.put(0, 2, affine.get(0, 2)[0]
                     + (TARGET_WIDTH - panel.cols()) / 2.0);
-            affine.put(1, 2, affine.get(1, 2)[0] + dy);
+            affine.put(1, 2, affine.get(1, 2)[0] + ty);
             leveled.release();
         }
 
@@ -577,6 +595,10 @@ public class VideoStreamingServer {
     }
 
     static double estimateRollDeg(Mat bgr) {
+        return estimateRollDeg(bgr, MAX_ROLL_DEG);
+    }
+
+    static double estimateRollDeg(Mat bgr, double maxAbsDeg) {
         Mat gray = new Mat();
         Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
         Imgproc.GaussianBlur(gray, gray, new Size(5, 5), 1.0);
@@ -585,13 +607,14 @@ public class VideoStreamingServer {
         int minLen = Math.max(36, bgr.cols() / 7);
         Imgproc.HoughLinesP(gray, lines, 1, Math.PI / 180.0, 40, minLen, 14);
         ArrayList<double[]> scored = new ArrayList<>();
+        double accept = Math.max(6.0, maxAbsDeg + 6.0);
         for (int i = 0; i < lines.rows(); i++) {
             double[] l = lines.get(i, 0);
             if (l == null || l.length < 4) continue;
             double ang = Math.toDegrees(Math.atan2(l[3] - l[1], l[2] - l[0]));
             while (ang > 90)  ang -= 180;
             while (ang < -90) ang += 180;
-            if (Math.abs(ang) > MAX_ROLL_DEG + 8) {
+            if (Math.abs(ang) > accept) {
                 continue;
             }
             double length = Math.hypot(l[2] - l[0], l[3] - l[1]);
@@ -612,8 +635,9 @@ public class VideoStreamingServer {
         java.util.Collections.sort(angles);
         double median = angles.get(angles.size() / 2);
         ArrayList<Double> clustered = new ArrayList<>();
+        double clusterW = Math.max(8.0, maxAbsDeg * 0.5);
         for (double a : angles) {
-            if (Math.abs(a - median) <= 14.0) {
+            if (Math.abs(a - median) <= clusterW) {
                 clustered.add(a);
             }
         }
@@ -621,9 +645,11 @@ public class VideoStreamingServer {
             java.util.Collections.sort(clustered);
             median = clustered.get(clustered.size() / 2);
         }
-        if (Math.abs(median) < 1.5) {
+        if (Math.abs(median) < 1.2) {
             return 0.0;
         }
+        if (median > maxAbsDeg) median = maxAbsDeg;
+        if (median < -maxAbsDeg) median = -maxAbsDeg;
         return median;
     }
 
@@ -652,6 +678,8 @@ public class VideoStreamingServer {
         int overlap = Math.min(OVERLAP_PX, W / 3);
         int panoW   = W + (N - 1) * (W - overlap);
 
+        double[] gain = sequentialGains(frames, overlap);
+
         Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
         Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
 
@@ -660,10 +688,15 @@ public class VideoStreamingServer {
             int xStart = i * (W - overlap);
 
             Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
-            multiplyByValidLuma(frames[i], weight);
+            Mat edgeW = edgeDistanceWeight(frames[i], EDGE_FEATHER_PX);
+            Core.multiply(weight, edgeW, weight);
+            edgeW.release();
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
+            if (Math.abs(gain[i] - 1.0) > 0.01) {
+                Core.multiply(frameF, new Scalar(gain[i], gain[i], gain[i]), frameF);
+            }
 
             Mat weight3 = new Mat();
             List<Mat> ch = new ArrayList<>();
@@ -715,8 +748,10 @@ public class VideoStreamingServer {
         if (overlap <= 0) {
             return mask;
         }
-        for (int x = 0; x < overlap; x++) {
-            float alpha = (float) (0.5 - 0.5 * Math.cos(Math.PI * x / overlap));
+        // Raised cosine over a wide band so seams dissolve instead of cutting.
+        int band = Math.max(overlap, Math.min(W / 2, overlap + 40));
+        for (int x = 0; x < band; x++) {
+            float alpha = (float) (0.5 - 0.5 * Math.cos(Math.PI * x / band));
             if (fadeLeft) {
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
@@ -731,18 +766,61 @@ public class VideoStreamingServer {
         return mask;
     }
 
-    /** Keep black letterbox from contributing to the blend (avoids dark seams). */
-    static void multiplyByValidLuma(Mat bgr, Mat weight) {
+    /**
+     * Fade every content border (including rotated corners) into black so
+     * neighboring panels mix instead of showing a hard rectangle.
+     */
+    static Mat edgeDistanceWeight(Mat bgr, int radius) {
         Mat gray = new Mat();
         Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat valid = new Mat();
-        Imgproc.threshold(gray, valid, VALID_LUMA_MIN, 1.0, Imgproc.THRESH_BINARY);
-        Mat validF = new Mat();
-        valid.convertTo(validF, CvType.CV_32FC1);
-        Core.multiply(weight, validF, weight);
+        Mat mask = new Mat();
+        Imgproc.threshold(gray, mask, VALID_LUMA_MIN, 255, Imgproc.THRESH_BINARY);
+        Mat dist = new Mat();
+        Imgproc.distanceTransform(mask, dist, Imgproc.DIST_L2, 3);
+        Mat weight = new Mat();
+        double scale = radius < 1 ? 1.0 : 1.0 / radius;
+        dist.convertTo(weight, CvType.CV_32FC1, scale);
+        Core.min(weight, new Scalar(1.0), weight);
         gray.release();
-        valid.release();
-        validF.release();
+        mask.release();
+        dist.release();
+        return weight;
+    }
+
+    static double[] sequentialGains(Mat[] frames, int overlap) {
+        double[] gain = new double[frames.length];
+        java.util.Arrays.fill(gain, 1.0);
+        for (int i = 1; i < frames.length; i++) {
+            double left = overlapMean(frames[i - 1], true, overlap);
+            double right = overlapMean(frames[i], false, overlap);
+            if (left < 8 || right < 8) {
+                continue;
+            }
+            double g = left / right;
+            if (g < 0.72) g = 0.72;
+            if (g > 1.38) g = 1.38;
+            gain[i] = gain[i - 1] * g;
+            if (gain[i] < 0.72) gain[i] = 0.72;
+            if (gain[i] > 1.38) gain[i] = 1.38;
+        }
+        return gain;
+    }
+
+    static double overlapMean(Mat bgr, boolean rightEdge, int overlap) {
+        int W = bgr.cols();
+        int H = bgr.rows();
+        int x0 = rightEdge ? W - overlap : 0;
+        int x1 = rightEdge ? W : overlap;
+        Mat roi = bgr.submat(0, H, x0, x1);
+        Mat gray = new Mat();
+        Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat mask = new Mat();
+        Imgproc.threshold(gray, mask, VALID_LUMA_MIN, 255, Imgproc.THRESH_BINARY);
+        Scalar m = Core.mean(gray, mask);
+        roi.release();
+        gray.release();
+        mask.release();
+        return m.val[0];
     }
 
     /**
@@ -753,11 +831,10 @@ public class VideoStreamingServer {
         int N = frames.length;
         double[] dy = new double[N];
         int overlap = Math.min(OVERLAP_PX, TARGET_WIDTH / 3);
-        double maxStep = TARGET_HEIGHT * 0.22;
         for (int i = 0; i < N - 1; i++) {
-            Point shift = overlapShift(frames[i], frames[i + 1], overlap);
-            if (shift != null && Math.abs(shift.y) <= maxStep) {
-                dy[i + 1] = dy[i] - shift.y;
+            double step = overlapDy(frames[i], frames[i + 1], overlap);
+            if (!Double.isNaN(step) && Math.abs(step) <= MAX_SEAM_DY) {
+                dy[i + 1] = dy[i] + step;
             } else {
                 dy[i + 1] = dy[i];
             }
@@ -771,16 +848,20 @@ public class VideoStreamingServer {
         return dy;
     }
 
-    static Point overlapShift(Mat left, Mat right, int overlap) {
-        if (left.empty() || right.empty() || overlap < 16) {
-            return null;
+    /**
+     * Vertical shift that maps {@code right} onto {@code left} in the overlap.
+     * Uses normalized cross-correlation (available on opencv-490.jar).
+     */
+    static double overlapDy(Mat left, Mat right, int overlap) {
+        if (left.empty() || right.empty() || overlap < 24) {
+            return Double.NaN;
         }
         int H = Math.min(left.rows(), right.rows());
         int W = Math.min(left.cols(), right.cols());
-        int y0 = (int) (H * 0.18);
-        int y1 = (int) (H * 0.82);
-        if (y1 - y0 < 24 || W < overlap) {
-            return null;
+        int y0 = (int) (H * 0.16);
+        int y1 = (int) (H * 0.84);
+        if (y1 - y0 < 48 || W < overlap) {
+            return Double.NaN;
         }
         Mat a = left.submat(y0, y1, W - overlap, W);
         Mat b = right.submat(y0, y1, 0, overlap);
@@ -788,25 +869,31 @@ public class VideoStreamingServer {
         Mat gb = new Mat();
         Imgproc.cvtColor(a, ga, Imgproc.COLOR_BGR2GRAY);
         Imgproc.cvtColor(b, gb, Imgproc.COLOR_BGR2GRAY);
-        Mat fa = new Mat();
-        Mat fb = new Mat();
-        ga.convertTo(fa, CvType.CV_64FC1);
-        gb.convertTo(fb, CvType.CV_64FC1);
-        if (Core.mean(fa).val[0] < 18 || Core.mean(fb).val[0] < 18) {
-            a.release(); b.release();
-            ga.release(); gb.release();
-            fa.release(); fb.release();
-            return null;
+
+        int band = gb.rows();
+        int templH = Math.max(24, (int) (band * 0.55));
+        int templY = (band - templH) / 2;
+        if (templY < 1 || templY + templH >= band) {
+            a.release(); b.release(); ga.release(); gb.release();
+            return Double.NaN;
         }
-        Mat win = new Mat();
-        Imgproc.createHanningWindow(win, fa.size(), CvType.CV_64FC1);
-        // Official Java bindings put this on Imgproc, not Core (opencv-490.jar).
-        Point shift = Imgproc.phaseCorrelate(fa, fb, win);
+        Mat templ = gb.rowRange(templY, templY + templH);
+        if (Core.mean(ga).val[0] < 18 || Core.mean(templ).val[0] < 18) {
+            a.release(); b.release(); ga.release(); gb.release();
+            return Double.NaN;
+        }
+        Mat result = new Mat();
+        Imgproc.matchTemplate(ga, templ, result, Imgproc.TM_CCOEFF_NORMED);
+        Core.MinMaxLocResult mm = Core.minMaxLoc(result);
         a.release(); b.release();
         ga.release(); gb.release();
-        fa.release(); fb.release();
-        win.release();
-        return shift;
+        result.release();
+        if (mm.maxVal < 0.18) {
+            return Double.NaN;
+        }
+        // maxLoc.y is where the template sits in `ga`; template was taken from
+        // `gb` at templY, so dy to apply to the right panel is maxLoc.y - templY.
+        return mm.maxLoc.y - templY;
     }
 
     static Mat[] applyVerticalShifts(Mat[] frames, double[] dy) {
