@@ -790,8 +790,8 @@ public class VideoStreamingServer {
         Imgproc.cvtColor(b, gb, Imgproc.COLOR_BGR2GRAY);
         Mat fa = new Mat();
         Mat fb = new Mat();
-        ga.convertTo(fa, CvType.CV_32FC1);
-        gb.convertTo(fb, CvType.CV_32FC1);
+        ga.convertTo(fa, CvType.CV_64FC1);
+        gb.convertTo(fb, CvType.CV_64FC1);
         if (Core.mean(fa).val[0] < 18 || Core.mean(fb).val[0] < 18) {
             a.release(); b.release();
             ga.release(); gb.release();
@@ -799,8 +799,9 @@ public class VideoStreamingServer {
             return null;
         }
         Mat win = new Mat();
-        Imgproc.createHanningWindow(win, fa.size(), CvType.CV_32FC1);
-        Point shift = Core.phaseCorrelate(fa, fb, win);
+        Imgproc.createHanningWindow(win, fa.size(), CvType.CV_64FC1);
+        // Official Java bindings put this on Imgproc, not Core (opencv-490.jar).
+        Point shift = Imgproc.phaseCorrelate(fa, fb, win);
         a.release(); b.release();
         ga.release(); gb.release();
         fa.release(); fb.release();
