@@ -24,9 +24,9 @@ import org.opencv.videoio.Videoio;
 /**
  * Multi-camera panoramic projection with a shared vehicle-frame horizon.
  *
- *   Each fisheye → 3D ray → R_camera → one vehicle frame → cylindrical (θ, φ)
- *   All four cameras warp into the SAME canvas (no sequential A+B+C+D stitch)
- *   Min-error seam in each overlap → multi-band blend
+ *   Each fisheye → OpenCV K,D project → one vehicle frame → cylinder
+ *   Optional left.calib / front.calib / right.calib / rear.calib next to clips
+ *   Else K is measured from the circular fisheye disk (not image center + FOV=180)
  *
  * Horizon is φ = 0 from pose. Clips: left / front / right / rear in the folder.
  */
@@ -41,10 +41,16 @@ public class VideoStreamingServer {
     private static final double PANEL_YAW_DEG = 120.0;
     /** Vertical field around the horizon (deg). */
     private static final double PANEL_PITCH_DEG = 70.0;
-    /** Assumed full fisheye FOV. Larger = sample closer to the disk center (less rim stretch). */
-    private static final double INPUT_FISHEYE_FOV_DEG = 180.0;
-    /** Do not sample the fisheye beyond this incidence angle (distorted rim). */
-    private static final double MAX_INCIDENCE_DEG = 76.0;
+    /**
+     * Fallback FOV only if no calib file and the fisheye disk cannot be measured.
+     * Prefer {@code left.calib} / disk estimate over this.
+     */
+    private static final double FALLBACK_FISHEYE_FOV_DEG = 190.0;
+    /**
+     * Skip only rays behind the camera or past this incidence. 89° keeps the
+     * outer disk (FedEx / bodywork) instead of dropping ~14° of FOV.
+     */
+    private static final double MAX_INCIDENCE_DEG = 89.0;
     /** Near-black remap holes. */
     private static final double INVALID_LUMA = 3.0;
     /** Half-width of the multi-band transition around the optimized seam. */
@@ -75,6 +81,11 @@ public class VideoStreamingServer {
             return;
         }
 
+        CameraCalibration[] cals = new CameraCalibration[CAM_ROLE.length];
+        for (int i = 0; i < CAM_ROLE.length; i++) {
+            cals[i] = CameraCalibration.loadOrDefault(folder, i);
+        }
+
         try {
             System.loadLibrary(Core.NATIVE_LIBRARY_NAME);
         } catch (UnsatisfiedLinkError e) {
@@ -84,7 +95,7 @@ public class VideoStreamingServer {
         loadFfmpegPlugin();
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/stitch", new StitchHandler(videos));
+        server.createContext("/stitch", new StitchHandler(videos, cals));
         server.createContext("/play",   new PlayerPageHandler());
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
@@ -92,9 +103,7 @@ public class VideoStreamingServer {
         System.out.println("Server started  ->  http://localhost:" + port + "/play");
         for (int i = 0; i < CAM_ROLE.length; i++) {
             System.out.println("  " + CAM_ROLE[i] + " = " + videos[i]
-                    + "  yaw=" + CAM_YAW_DEG[i]
-                    + " pitch=" + CAM_PITCH_DEG[i]
-                    + " roll=" + CAM_ROLL_DEG[i]);
+                    + "  " + cals[i].describe());
         }
     }
 
@@ -153,7 +162,11 @@ public class VideoStreamingServer {
 
     private static class StitchHandler implements HttpHandler {
         private final Path[] videoFiles;
-        StitchHandler(Path[] f) { this.videoFiles = f; }
+        private final CameraCalibration[] cals;
+        StitchHandler(Path[] f, CameraCalibration[] c) {
+            this.videoFiles = f;
+            this.cals = c;
+        }
 
         @Override public void handle(HttpExchange ex) throws IOException {
             if (!"GET".equalsIgnoreCase(ex.getRequestMethod())) {
@@ -173,7 +186,7 @@ public class VideoStreamingServer {
 
             SphericalPanel[] panels = new SphericalPanel[videoFiles.length];
             for (int i = 0; i < panels.length; i++) {
-                panels[i] = new SphericalPanel(i);
+                panels[i] = new SphericalPanel(cals[i]);
             }
 
             int overlap = panelOverlapPx();
@@ -256,48 +269,207 @@ public class VideoStreamingServer {
     }
 
     /**
-     * One surround camera: cylindrical dest pixels are inverse-projected through
-     * the vehicle frame and the fisheye model into the raw frame. Rays beyond
-     * {@code MAX_INCIDENCE_DEG} are left unmapped so the seam can use the
-     * neighbor instead of a stretched rim.
+     * Per-camera OpenCV fisheye intrinsics + mount pose.
+     * Put {@code left.calib}, {@code front.calib}, {@code right.calib}, {@code rear.calib}
+     * next to the clips (key=value: fx fy cx cy k1 k2 k3 k4 yaw pitch roll).
+     * If missing, K is estimated from the circular fisheye disk on the first frame.
+     */
+    static final class CameraCalibration {
+        final String role;
+        double fx, fy, cx, cy;
+        double k1, k2, k3, k4;
+        double yawDeg, pitchDeg, rollDeg;
+        boolean hasFile;
+        boolean hasIntrinsics;
+
+        CameraCalibration(String role, double yawDeg, double pitchDeg, double rollDeg) {
+            this.role = role;
+            this.yawDeg = yawDeg;
+            this.pitchDeg = pitchDeg;
+            this.rollDeg = rollDeg;
+        }
+
+        static CameraCalibration loadOrDefault(Path folder, int index) {
+            CameraCalibration c = new CameraCalibration(
+                    CAM_ROLE[index],
+                    CAM_YAW_DEG[index],
+                    CAM_PITCH_DEG[index],
+                    CAM_ROLL_DEG[index]);
+            Path[] candidates = {
+                folder.resolve(CAM_ROLE[index] + ".calib"),
+                folder.resolve("calib").resolve(CAM_ROLE[index] + ".calib"),
+                folder.resolve(CAM_ROLE[index] + ".txt")
+            };
+            for (Path p : candidates) {
+                if (c.loadFile(p)) {
+                    c.hasFile = true;
+                    break;
+                }
+            }
+            return c;
+        }
+
+        boolean loadFile(Path path) {
+            if (!isUsableFile(path)) {
+                return false;
+            }
+            try {
+                List<String> lines = Files.readAllLines(path);
+                int got = 0;
+                for (String raw : lines) {
+                    String line = raw.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    line = line.replace('=', ' ').replace(',', ' ');
+                    String[] p = line.split("\\s+");
+                    if (p.length < 2) continue;
+                    String key = p[0].toLowerCase(Locale.ROOT);
+                    double val = Double.parseDouble(p[1]);
+                    switch (key) {
+                        case "fx": fx = val; got++; break;
+                        case "fy": fy = val; got++; break;
+                        case "cx": cx = val; got++; break;
+                        case "cy": cy = val; got++; break;
+                        case "k1": k1 = val; break;
+                        case "k2": k2 = val; break;
+                        case "k3": k3 = val; break;
+                        case "k4": k4 = val; break;
+                        case "yaw": yawDeg = val; break;
+                        case "pitch": pitchDeg = val; break;
+                        case "roll": rollDeg = val; break;
+                        default: break;
+                    }
+                }
+                if (got >= 4) {
+                    hasIntrinsics = true;
+                    System.out.println("Loaded " + path.getFileName() + " for " + role);
+                    return true;
+                }
+            } catch (Exception e) {
+                System.err.println("Could not read " + path + ": " + e.getMessage());
+            }
+            return false;
+        }
+
+        /** Measure the circular fisheye disk so cx/cy are not assumed image-center. */
+        void estimateFromFrame(Mat bgr) {
+            if (hasIntrinsics) {
+                return;
+            }
+            int w = bgr.cols();
+            int h = bgr.rows();
+            Mat gray = new Mat();
+            Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
+            Imgproc.GaussianBlur(gray, gray, new Size(9, 9), 0);
+            Mat mask = new Mat();
+            Imgproc.threshold(gray, mask, 8, 255, Imgproc.THRESH_BINARY);
+            int k = Math.max(9, Math.min(w, h) / 40);
+            if ((k & 1) == 0) k++;
+            Mat kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, new Size(k, k));
+            Imgproc.morphologyEx(mask, mask, Imgproc.MORPH_CLOSE, kernel);
+
+            List<MatOfPoint> contours = new ArrayList<>();
+            Mat hierarchy = new Mat();
+            Imgproc.findContours(mask, contours, hierarchy,
+                    Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+
+            double bestArea = 0;
+            Point center = new Point(w / 2.0, h / 2.0);
+            float[] radius = new float[] { (float) (Math.min(w, h) * 0.48) };
+            for (MatOfPoint c : contours) {
+                double area = Imgproc.contourArea(c);
+                if (area < bestArea) continue;
+                MatOfPoint2f pts = new MatOfPoint2f();
+                c.convertTo(pts, CvType.CV_32F);
+                Point cc = new Point();
+                float[] rr = new float[1];
+                Imgproc.minEnclosingCircle(pts, cc, rr);
+                pts.release();
+                if (rr[0] < Math.min(w, h) * 0.28) continue;
+                bestArea = area;
+                center = cc;
+                radius[0] = rr[0];
+            }
+
+            cx = center.x;
+            cy = center.y;
+            double thetaMax = Math.toRadians(FALLBACK_FISHEYE_FOV_DEG) / 2.0;
+            fx = fy = radius[0] / thetaMax;
+            hasIntrinsics = true;
+            System.out.println(role + " K from fisheye disk: fx=" + String.format(Locale.US, "%.1f", fx)
+                    + " cx=" + String.format(Locale.US, "%.1f", cx)
+                    + " cy=" + String.format(Locale.US, "%.1f", cy)
+                    + " R=" + String.format(Locale.US, "%.1f", radius[0]));
+
+            gray.release();
+            mask.release();
+            kernel.release();
+            hierarchy.release();
+        }
+
+        /**
+         * OpenCV fisheye forward model (not r = fθ):
+         * a=x/z, b=y/z, θ=atan(r), θd=θ(1+k1θ²+…), u=fx*(θd/r)*a+cx
+         */
+        void project(double xc, double yc, double zc, double[] uv) {
+            double a = xc / zc;
+            double b = yc / zc;
+            double r = Math.hypot(a, b);
+            double theta = Math.atan(r);
+            double t2 = theta * theta;
+            double t4 = t2 * t2;
+            double thetaD = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t4 * t2 + k4 * t4 * t4);
+            double scale = (r > 1e-12) ? thetaD / r : 1.0;
+            uv[0] = fx * scale * a + cx;
+            uv[1] = fy * scale * b + cy;
+        }
+
+        String describe() {
+            String src = hasFile ? "file" : (hasIntrinsics ? "disk" : "pending");
+            return "yaw=" + yawDeg + " pitch=" + pitchDeg + " roll=" + rollDeg
+                    + " K[" + src + "]";
+        }
+    }
+
+    /**
+     * Cylindrical dest pixel → vehicle ray → camera ray → OpenCV fisheye (K,D).
      */
     static final class SphericalPanel {
-        private final int index;
-        private final double[] R; // camera-to-vehicle, row-major
+        private final CameraCalibration calib;
+        private final double[] R;
         private Mat map1;
         private Mat map2;
         private int cachedSrcW = -1;
         private int cachedSrcH = -1;
 
-        SphericalPanel(int index) {
-            this.index = index;
-            this.R = cameraToVehicle(CAM_YAW_DEG[index],
-                    CAM_PITCH_DEG[index], CAM_ROLL_DEG[index]);
+        SphericalPanel(CameraCalibration calib) {
+            this.calib = calib;
+            this.R = cameraToVehicle(calib.yawDeg, calib.pitchDeg, calib.rollDeg);
         }
 
         void project(Mat src, Mat dst) {
             if (src == null || src.empty()) {
                 return;
             }
-            ensureMaps(src.cols(), src.rows());
+            ensureMaps(src);
             Imgproc.remap(src, dst, map1, map2, Imgproc.INTER_LINEAR,
                     Core.BORDER_CONSTANT, new Scalar(0, 0, 0));
         }
 
-        private void ensureMaps(int srcW, int srcH) {
+        private void ensureMaps(Mat src) {
+            int srcW = src.cols();
+            int srcH = src.rows();
             if (map1 != null && srcW == cachedSrcW && srcH == cachedSrcH) {
                 return;
             }
-            double f = fisheyeFocal(srcW, srcH, INPUT_FISHEYE_FOV_DEG);
-            double cx = srcW / 2.0;
-            double cy = srcH / 2.0;
-            double yaw0 = Math.toRadians(CAM_YAW_DEG[index]);
+            calib.estimateFromFrame(src);
+
+            double yaw0 = Math.toRadians(calib.yawDeg);
             double yawSpan = Math.toRadians(PANEL_YAW_DEG);
             double pitchSpan = Math.toRadians(PANEL_PITCH_DEG);
             double horizonY = HORIZON_FRACTION * PANEL_HEIGHT;
-            // Cylindrical vertical: equal meters on a cylinder, less edge squash than linear φ.
-            double fy = (PANEL_HEIGHT / 2.0) / Math.tan(pitchSpan / 2.0);
+            double fyCyl = (PANEL_HEIGHT / 2.0) / Math.tan(pitchSpan / 2.0);
             double maxInc = Math.toRadians(MAX_INCIDENCE_DEG);
+            double[] uv = new double[2];
 
             Mat mapX = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
             Mat mapY = new Mat(PANEL_HEIGHT, PANEL_WIDTH, CvType.CV_32FC1);
@@ -305,7 +477,7 @@ public class VideoStreamingServer {
             float[] rowY = new float[PANEL_WIDTH];
 
             for (int v = 0; v < PANEL_HEIGHT; v++) {
-                double phi = Math.atan((horizonY - (v + 0.5)) / fy);
+                double phi = Math.atan((horizonY - (v + 0.5)) / fyCyl);
                 double cphi = Math.cos(phi);
                 double sphi = Math.sin(phi);
                 for (int u = 0; u < PANEL_WIDTH; u++) {
@@ -316,7 +488,7 @@ public class VideoStreamingServer {
                     double xc = R[0] * xv + R[3] * yv + R[6] * zv;
                     double yc = R[1] * xv + R[4] * yv + R[7] * zv;
                     double zc = R[2] * xv + R[5] * yv + R[8] * zv;
-                    if (zc <= 1e-4) {
+                    if (zc <= 1e-6) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
                         continue;
@@ -327,10 +499,9 @@ public class VideoStreamingServer {
                         rowY[u] = -1f;
                         continue;
                     }
-                    double r = f * inc;
-                    double az = Math.atan2(yc, xc);
-                    float su = (float) (cx + r * Math.cos(az));
-                    float sv = (float) (cy + r * Math.sin(az));
+                    calib.project(xc, yc, zc, uv);
+                    float su = (float) uv[0];
+                    float sv = (float) uv[1];
                     if (su < 1 || sv < 1 || su >= srcW - 1 || sv >= srcH - 1) {
                         rowX[u] = -1f;
                         rowY[u] = -1f;
@@ -409,11 +580,6 @@ public class VideoStreamingServer {
             }
         }
         return c;
-    }
-
-    static double fisheyeFocal(int width, int height, double fovDeg) {
-        double half = Math.toRadians(fovDeg) / 2.0;
-        return (Math.min(width, height) / 2.0) / half;
     }
 
     static int panelOverlapPx() {
