@@ -38,12 +38,17 @@ public class VideoStreamingServer {
     /** Row of the common world horizon (fraction from the top). */
     private static final double HORIZON_FRACTION = 0.40;
     /** Horizontal field of each spherical panel (deg). >90 leaves overlap. */
-    private static final double PANEL_YAW_DEG = 112.0;
+    private static final double PANEL_YAW_DEG = 118.0;
     /** Vertical field around the horizon (deg). */
     private static final double PANEL_PITCH_DEG = 72.0;
     /** Equidistant fisheye input FOV used to build K when no calib file exists. */
     private static final double INPUT_FISHEYE_FOV_DEG = 160.0;
-    private static final double VALID_LUMA_MIN = 12.0;
+    /** Only treat near-black remap holes as invalid (keep dark asphalt). */
+    private static final double INVALID_LUMA = 3.0;
+    /** Minimum seam width in pixels so feeds dissolve instead of overwriting. */
+    private static final int MIN_BLEND_PX = 200;
+    /** Fade distance from unmapped (black) pixels. */
+    private static final int EDGE_FEATHER_PX = 56;
 
     /** Vehicle yaw of each camera, Left → Front → Right → Rear. */
     private static final double[] CAM_YAW_DEG   = { -90.0, 0.0, 90.0, 180.0 };
@@ -397,6 +402,7 @@ public class VideoStreamingServer {
         double overlapDeg = PANEL_YAW_DEG - spacing;
         if (overlapDeg < 4.0) overlapDeg = 4.0;
         int px = (int) Math.round(overlapDeg / PANEL_YAW_DEG * PANEL_WIDTH);
+        px = Math.max(MIN_BLEND_PX, px);
         return Math.max(16, Math.min(PANEL_WIDTH / 3, px));
     }
 
@@ -405,17 +411,26 @@ public class VideoStreamingServer {
         int H = PANEL_HEIGHT;
         int W = PANEL_WIDTH;
         int panoW = W + (N - 1) * (W - overlap);
+        double[] gain = sequentialGains(frames, overlap);
 
         Mat accumColor  = Mat.zeros(H, panoW, CvType.CV_32FC3);
         Mat accumWeight = Mat.zeros(H, panoW, CvType.CV_32FC1);
 
         for (int i = 0; i < N; i++) {
             int xStart = i * (W - overlap);
-            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1);
-            multiplyByValidLuma(frames[i], weight);
+            // Incoming panel ramps in slowly so it does not stamp over the
+            // previous feed (the left→front overwrite). Outgoing stays visible
+            // longer into the seam.
+            Mat weight = buildFeatherMask(H, W, overlap, i > 0, i < N - 1, 1.70, 0.52);
+            Mat edgeW = edgeDistanceWeight(frames[i], EDGE_FEATHER_PX);
+            Core.multiply(weight, edgeW, weight);
+            edgeW.release();
 
             Mat frameF = new Mat();
             frames[i].convertTo(frameF, CvType.CV_32FC3);
+            if (Math.abs(gain[i] - 1.0) > 0.01) {
+                Core.multiply(frameF, new Scalar(gain[i], gain[i], gain[i]), frameF);
+            }
             Mat weight3 = new Mat();
             List<Mat> ch = new ArrayList<>();
             ch.add(weight); ch.add(weight); ch.add(weight);
@@ -457,19 +472,27 @@ public class VideoStreamingServer {
         return result;
     }
 
-    static Mat buildFeatherMask(int H, int W, int overlap, boolean fadeLeft, boolean fadeRight) {
+    /**
+     * Raised-cosine seam. {@code inExp} &gt; 1 makes the new panel fade in slowly;
+     * {@code outExp} &lt; 1 keeps the old panel visible further into the overlap.
+     */
+    static Mat buildFeatherMask(int H, int W, int overlap,
+                                boolean fadeLeft, boolean fadeRight,
+                                double inExp, double outExp) {
         Mat mask = new Mat(H, W, CvType.CV_32FC1, new Scalar(1.0));
         if (overlap <= 0) {
             return mask;
         }
         for (int x = 0; x < overlap; x++) {
-            float alpha = (float) (0.5 - 0.5 * Math.cos(Math.PI * x / overlap));
+            double cosine = 0.5 - 0.5 * Math.cos(Math.PI * x / overlap);
             if (fadeLeft) {
+                float alpha = (float) Math.pow(cosine, inExp);
                 Mat colL = mask.col(x);
                 colL.setTo(new Scalar(alpha));
                 colL.release();
             }
             if (fadeRight) {
+                float alpha = (float) Math.pow(cosine, outExp);
                 Mat colR = mask.col(W - 1 - x);
                 colR.setTo(new Scalar(alpha));
                 colR.release();
@@ -478,17 +501,57 @@ public class VideoStreamingServer {
         return mask;
     }
 
-    static void multiplyByValidLuma(Mat bgr, Mat weight) {
+    static Mat edgeDistanceWeight(Mat bgr, int radius) {
         Mat gray = new Mat();
         Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY);
-        Mat valid = new Mat();
-        Imgproc.threshold(gray, valid, VALID_LUMA_MIN, 1.0, Imgproc.THRESH_BINARY);
-        Mat validF = new Mat();
-        valid.convertTo(validF, CvType.CV_32FC1);
-        Core.multiply(weight, validF, weight);
+        Mat mask = new Mat();
+        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
+        Mat dist = new Mat();
+        Imgproc.distanceTransform(mask, dist, Imgproc.DIST_L2, 3);
+        Mat weight = new Mat();
+        double scale = radius < 1 ? 1.0 : 1.0 / radius;
+        dist.convertTo(weight, CvType.CV_32FC1, scale);
+        Core.min(weight, new Scalar(1.0), weight);
         gray.release();
-        valid.release();
-        validF.release();
+        mask.release();
+        dist.release();
+        return weight;
+    }
+
+    static double[] sequentialGains(Mat[] frames, int overlap) {
+        double[] gain = new double[frames.length];
+        java.util.Arrays.fill(gain, 1.0);
+        for (int i = 1; i < frames.length; i++) {
+            double left = overlapMean(frames[i - 1], true, overlap);
+            double right = overlapMean(frames[i], false, overlap);
+            if (left < 8 || right < 8) {
+                continue;
+            }
+            double g = left / right;
+            if (g < 0.75) g = 0.75;
+            if (g > 1.35) g = 1.35;
+            gain[i] = gain[i - 1] * g;
+            if (gain[i] < 0.75) gain[i] = 0.75;
+            if (gain[i] > 1.35) gain[i] = 1.35;
+        }
+        return gain;
+    }
+
+    static double overlapMean(Mat bgr, boolean rightEdge, int overlap) {
+        int W = bgr.cols();
+        int H = bgr.rows();
+        int x0 = rightEdge ? W - overlap : 0;
+        int x1 = rightEdge ? W : overlap;
+        Mat roi = bgr.submat(0, H, x0, x1);
+        Mat gray = new Mat();
+        Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
+        Mat mask = new Mat();
+        Imgproc.threshold(gray, mask, INVALID_LUMA, 255, Imgproc.THRESH_BINARY);
+        Scalar m = Core.mean(gray, mask);
+        roi.release();
+        gray.release();
+        mask.release();
+        return m.val[0];
     }
 
     static Path ensureDecodable(Path requested) {
